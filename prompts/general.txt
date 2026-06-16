@@ -1,0 +1,3 @@
+<|im_start|>user
+Explain how a hash map achieves average-case O(1) lookup, what causes collisions, and how open addressing differs from separate chaining. /no_think<|im_end|>
+<|im_start|>assistant

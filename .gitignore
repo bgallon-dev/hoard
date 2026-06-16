@@ -1,0 +1,31 @@
+# ---- large data: download / build separately (see README) ----
+models/
+*.gguf
+reference/
+
+# ---- build artifacts ----
+build/
+*.exe
+*.dll
+*.o
+*.obj
+*.exp
+*.lib
+*.a
+
+# ---- research papers (copyrighted; cited by arXiv id in README) ----
+docs/
+
+# ---- logs / archives / scratch ----
+*.log
+*.zip
+*.bin
+bench/
+# binary reference-activation dumps (validation scratch)
+notes/ref_acts/
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/

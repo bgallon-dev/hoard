@@ -1,0 +1,17 @@
+<|im_start|>user
+Review this C function for bugs and suggest fixes:
+
+int* merge_sorted(int* a, int n, int* b, int m) {
+    int* out = malloc((n + m) * sizeof(int));
+    int i = 0, j = 0, k = 0;
+    while (i < n && j < m) {
+        if (a[i] <= b[j]) out[k++] = a[i++];
+        else out[k++] = b[j++];
+    }
+    while (i < n) out[k++] = a[i++];
+    while (j <= m) out[k++] = b[j++];
+    return out;
+}
+
+Point out memory-safety issues, off-by-one errors, and missing error handling. /no_think<|im_end|>
+<|im_start|>assistant
