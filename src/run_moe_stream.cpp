@@ -224,7 +224,8 @@ int main(int argc,char**argv){
     ggml_backend_t backend=ggml_backend_dev_init(vk0,nullptr);
     Model M; HostExperts H; load_model(M,H,argv[1],backend);
     // device-direct parallel reader: 8 workers (>= QD4 saturation), scratch sized to the largest expert sub-read.
-    DirectIO io; io.init(argv[1],8);
+    int ioqd = getenv("IOQD")?atoi(getenv("IOQD")):8; if(ioqd<1) ioqd=1;   // IOQD=N -> vary effective NVMe queue depth
+    DirectIO io; io.init(argv[1],ioqd);
     size_t gbsz,ubsz,dbsz; { size_t mg=0,mu=0,md=0; for(int il=0;il<n_layer;++il){ if(H.gstride[il]>mg)mg=H.gstride[il]; if(H.ustride[il]>mu)mu=H.ustride[il]; if(H.dstride[il]>md)md=H.dstride[il]; }
         auto rup=[](size_t v){ return (v+8192+4095)&~(size_t)4095; }; gbsz=rup(mg); ubsz=rup(mu); dbsz=rup(md);
         fprintf(stderr,"[directIO] 8 workers, reads land DIRECTLY in aligned RT buffers (no scratch/memcpy); buf g/u/d=%zu/%zu/%zu KB\n",gbsz/1024,ubsz/1024,dbsz/1024); }
@@ -266,6 +267,11 @@ int main(int argc,char**argv){
     std::set<int> touched;                 // distinct (il*n_expert+e) selected = WORKING SET
     bool trace=getenv("TRACE")!=nullptr;   // log per-(token,layer) selection -> prefetch-predictor ceiling
     std::vector<std::vector<std::vector<int>>> seltrace;   // [decode_tok][layer] = selected experts
+    // --- benchmark instrumentation (all env-gated; a normal run sets none of these, so behaviour is unchanged) ---
+    double throttle_Bps = getenv("THROTTLE_MBPS") ? atof(getenv("THROTTLE_MBPS"))*1e6 : 0.0; // simulate a slower drive
+    const char* csvpath = getenv("CSV"); FILE* csvf=nullptr;                                  // per-token metrics CSV
+    if(csvpath){ csvf=fopen(csvpath,"w"); if(csvf) fprintf(csvf,"tok,t_ms,dt_ms,vram_hit,ram_hit,nvme_fall,reqs,distinct,disk_mb\n"); }
+    long long tok_first_ns=0, tok_prev_ns=0;   // per-token wall-clock -> hit-rate-over-time + latency percentiles
     size_t vram = ggml_backend_buffer_get_size(M.wbuf)+ggml_backend_buffer_get_size(kv.buf)+ggml_backend_buffer_get_size(S.buf);
 
     // fetch expert (il,e) bytes into the RAM tier; return RAM slot. RAM hit or NVMe fall-through.
@@ -398,7 +404,13 @@ int main(int argc,char**argv){
                 struct timespec d0,d1; clock_gettime(CLOCK_MONOTONIC,&d0);
                 run_jobs(io,jobs);
                 clock_gettime(CLOCK_MONOTONIC,&d1);
-                { long long _dd=(d1.tv_sec-d0.tv_sec)*1000000000LL+(d1.tv_nsec-d0.tv_nsec); disk_ns+=_dd; if(p>=T) tDisk+=_dd; }
+                { long long _dd=(d1.tv_sec-d0.tv_sec)*1000000000LL+(d1.tv_nsec-d0.tv_nsec); disk_ns+=_dd; if(p>=T) tDisk+=_dd;
+                  // storage-bandwidth throttle: cap effective drive speed by sleeping out the rest of this batch's
+                  // budget. Gated to the timed decode region (p>=T) so one-time prefill cold-load isn't throttled.
+                  if(throttle_Bps>0 && p>=T){ size_t bb=0; for(auto&jb:jobs) bb+=jb.rsize;
+                      if(bb>0){ long long tgt=(long long)((double)bb/throttle_Bps*1e9), slp=tgt-_dd;
+                          if(slp>0){ struct timespec ts{(time_t)(slp/1000000000LL),(long)(slp%1000000000LL)}; nanosleep(&ts,nullptr);
+                              disk_ns+=slp; if(p>=T) tDisk+=slp; } } } }
                 for(auto&jb:jobs) disk_bytes += jb.rsize;
                 // Phase C (serial): stage RAM->VRAM (ggml/Vulkan backend is single-threaded)
                 for(int j=0;j<n_used;++j){ if(vhit[j]) continue; int e=sel[j], rs=ramslot[j];
@@ -459,6 +471,10 @@ int main(int argc,char**argv){
             }
             int bi=0; float bv=logits[0]; for(int v=1;v<n_vocab;++v) if(logits[v]>bv){bv=logits[v];bi=v;}
             gen.push_back(bi); on_token(bi);
+            if(csvf){ long long now=NOW(); if(!tok_first_ns) tok_first_ns=now;
+                double t_ms=(now-tok_first_ns)/1e6, dt_ms=tok_prev_ns?(now-tok_prev_ns)/1e6:0; tok_prev_ns=now;
+                fprintf(csvf,"%zu,%.3f,%.3f,%ld,%ld,%ld,%ld,%zu,%.3f\n",
+                    gen.size(),t_ms,dt_ms,vram_hit,ram_hit,nvme_fall,reqs,touched.size(),disk_bytes/1e6); fflush(csvf); }
             if(mode!="chat" && gen.size()%16==0) // saturation curve: cumulative distinct experts vs token position
                 fprintf(stderr,"[ws@%3zu tok] %4zu distinct experts (%.1f%% of model, %.0f MB)\n",
                     gen.size(),touched.size(),100.0*touched.size()/(double)(n_layer*n_expert),
@@ -510,6 +526,7 @@ int main(int argc,char**argv){
 
     // ---- one-shot generation (benchmark / validation) ----
     generate(seq,T,ngen,[](int){});
+    if(csvf) fclose(csvf);
     double secs=(t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)/1e9;
     vram += peak_compute;
 

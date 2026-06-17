@@ -44,8 +44,9 @@ static bool has_qk_norm=false;            // OLMoE/Qwen3 yes; Qwen2/Mixtral no
 static bool qk_perhead=false;             // Qwen3: QK-norm per-head over head_dim (post-reshape); OLMoE: full pre-reshape
 static bool wnorm=false;                  // norm_topk_prob: renormalize top-k router weights to sum 1 (Qwen3=true, OLMoE=false)
 static int  eos_id=50279;                 // read from GGUF tokenizer.ggml.eos_token_id (OLMoE 50279, Qwen3 151645)
-// --- qwen35moe: hybrid Gated Delta Net (linear attn) + full attention ---
-static bool is_qwen35=false;
+// --- qwen35moe / qwen3next: hybrid Gated Delta Net (linear attn) + full attention ---
+static bool is_qwen35=false;     // either hybrid-GDN arch (qwen35moe OR qwen3next)
+static bool is_qwen3next=false;  // qwen3next only: fused ssm_ba (vs separate beta/alpha), NEOX rope (vs IMRoPE mrope)
 static int  ssm_d_conv=4,ssm_d_inner=0,ssm_d_state=0,ssm_dt_rank=0,ssm_n_group=0; // GDN linear-attn dims
 static int  n_ff_shexp=0;                  // shared-expert FFN length (0=none)
 static int  full_attn_interval=4;          // every Nth layer (1-indexed) is full attention
@@ -156,8 +157,9 @@ static void load_model(Model& M, HostExperts& H, const char* path, ggml_backend_
     // norm_topk_prob: llama.cpp hardcodes norm_w per-arch (qwen3moe=true, olmoe=false). Not a GGUF key.
     wnorm = (ARCH=="olmoe") ? false : true;              // OLMoE is the no-renorm exception; modern MoE renormalize
     eos_id = (int)gku32(gguf,"tokenizer.ggml.eos_token_id",50279);
-    // ---- qwen35moe (hybrid Gated Delta Net + full attention) ----
-    is_qwen35 = (ARCH=="qwen35moe");
+    // ---- qwen35moe / qwen3next (hybrid Gated Delta Net + full attention) ----
+    is_qwen35    = (ARCH=="qwen35moe" || ARCH=="qwen3next"); // shared GDN+shexp engine
+    is_qwen3next = (ARCH=="qwen3next");                      // fused ssm_ba + NEOX rope variant
     if(is_qwen35){
         ssm_d_conv  = (int)gku32(gguf,KEY("ssm.conv_kernel"),4);
         ssm_d_inner = (int)gku32(gguf,KEY("ssm.inner_size"),0);
@@ -170,8 +172,9 @@ static void load_model(Model& M, HostExperts& H, const char* path, ggml_backend_
           if(ki>=0 && gguf_get_arr_n(gguf,ki)>=4){ const int32_t* a=(const int32_t*)gguf_get_arr_data(gguf,ki); for(int s=0;s<4;++s) rope_sections[s]=a[s]; } }
         is_recr.assign(n_layer,0); int nl=0,nf=0;
         for(int il=0;il<n_layer;++il){ is_recr[il] = ((il+1)%full_attn_interval!=0)?1:0; if(is_recr[il])nl++; else nf++; }
-        fprintf(stderr,"[qwen35] ssm conv=%d inner=%d state=%d dt_rank/Vheads=%d n_group/Kheads=%d | shexp_ff=%d | full_attn_every %d -> %d linear, %d full | rope_sec=%d,%d,%d,%d\n",
-            ssm_d_conv,ssm_d_inner,ssm_d_state,ssm_dt_rank,ssm_n_group,n_ff_shexp,full_attn_interval,nl,nf,rope_sections[0],rope_sections[1],rope_sections[2],rope_sections[3]);
+        fprintf(stderr,"[%s] ssm conv=%d inner=%d state=%d dt_rank/Vheads=%d n_group/Kheads=%d | shexp_ff=%d | full_attn_every %d -> %d linear, %d full | rope=%s sec=%d,%d,%d,%d\n",
+            ARCH.c_str(),ssm_d_conv,ssm_d_inner,ssm_d_state,ssm_dt_rank,ssm_n_group,n_ff_shexp,full_attn_interval,nl,nf,
+            is_qwen3next?"NEOX(64)":"IMRoPE",rope_sections[0],rope_sections[1],rope_sections[2],rope_sections[3]);
     }
     fprintf(stderr,"[hparams2] n_embd_attn=%d qk_norm_dim=%d qk_perhead=%d wnorm=%d\n",n_embd_attn,qk_norm_dim,(int)qk_perhead,(int)wnorm);
     fprintf(stderr,"[hparams] arch=%s layers=%d embd=%d heads=%d/%d head_dim=%d n_ff=%d experts=%d/%d vocab=%d rope=%.0f eps=%.1e qknorm=%d\n",
@@ -187,11 +190,12 @@ static void load_model(Model& M, HostExperts& H, const char* path, ggml_backend_
     std::map<std::string,ggml_tensor*> nesrc;
     for(ggml_tensor* t=ggml_get_first_tensor(all); t; t=ggml_get_next_tensor(all,t)){
         if(is_exp(t->name)) continue;
-        ggml_tensor* c=ggml_new_tensor(nectx,t->type,GGML_MAX_DIMS,t->ne); ggml_set_name(c,t->name); nesrc[t->name]=c;
+        ggml_type ct=(t->type==GGML_TYPE_BF16)?GGML_TYPE_F32:t->type; // Vulkan has no bf16 kernel -> upconvert (qwen3next ffn_gate_inp_shexp)
+        ggml_tensor* c=ggml_new_tensor(nectx,ct,GGML_MAX_DIMS,t->ne); ggml_set_name(c,t->name); nesrc[t->name]=c;
     }
     M.wbuf=ggml_backend_alloc_ctx_tensors(nectx,backend);
 
-    H.f=fopen(path,"rb"); size_t doff=gguf_get_data_offset(gguf); std::vector<uint8_t> buf;
+    H.f=fopen(path,"rb"); size_t doff=gguf_get_data_offset(gguf); std::vector<uint8_t> buf; int n_bf16=0;
     for(ggml_tensor* t=ggml_get_first_tensor(all); t; t=ggml_get_next_tensor(all,t)){
         int64_t ti=gguf_find_tensor(gguf,t->name); size_t off=gguf_get_tensor_offset(gguf,ti), nb=ggml_nbytes(t);
         if(is_exp(t->name)){
@@ -204,10 +208,16 @@ static void load_model(Model& M, HostExperts& H, const char* path, ggml_backend_
         } else {
             buf.resize(nb); _fseeki64(H.f,(int64_t)(doff+off),SEEK_SET);
             if(fread(buf.data(),1,nb,H.f)!=nb){fprintf(stderr,"read fail %s\n",t->name);exit(1);}
-            ggml_backend_tensor_set(nesrc[t->name],buf.data(),0,nb); M.ten[t->name]=nesrc[t->name];
+            if(t->type==GGML_TYPE_BF16){ // upconvert bf16->f32 (high 16 bits of the f32); Vulkan lacks a bf16 path
+                int64_t ne=ggml_nelements(t); std::vector<float> f32((size_t)ne); const uint16_t* s=(const uint16_t*)buf.data();
+                for(int64_t i=0;i<ne;++i){ uint32_t bits=((uint32_t)s[i])<<16; memcpy(&f32[i],&bits,4); }
+                ggml_backend_tensor_set(nesrc[t->name],f32.data(),0,(size_t)ne*4); n_bf16++;
+            } else ggml_backend_tensor_set(nesrc[t->name],buf.data(),0,nb);
+            M.ten[t->name]=nesrc[t->name];
         }
     }
     M.ctx=nectx; M.gguf=gguf;   // keep H.f OPEN for on-demand disk reads
+    if(n_bf16) fprintf(stderr,"[bf16->f32] upconverted %d bf16 tensors (Vulkan has no bf16 path)\n",n_bf16);
     fprintf(stderr,"loaded: %zu non-expert VRAM tensors; experts ON DISK (per-expert ~%.1f MB)\n",
         M.ten.size(),(H.gstride[0]+H.ustride[0]+H.dstride[0])/1e6);
 }
@@ -248,7 +258,8 @@ int main(int argc,char**argv){
     ggml_backend_t backend=ggml_backend_dev_init(vk0,nullptr);
     Model M; HostExperts H; load_model(M,H,argv[1],backend);
     // device-direct parallel reader: 8 workers (>= QD4 saturation), scratch sized to the largest expert sub-read.
-    DirectIO io; io.init(argv[1],8);
+    int ioqd = getenv("IOQD")?atoi(getenv("IOQD")):8; if(ioqd<1) ioqd=1;   // IOQD=N -> vary effective NVMe queue depth
+    DirectIO io; io.init(argv[1],ioqd);
     size_t gbsz,ubsz,dbsz; { size_t mg=0,mu=0,md=0; for(int il=0;il<n_layer;++il){ if(H.gstride[il]>mg)mg=H.gstride[il]; if(H.ustride[il]>mu)mu=H.ustride[il]; if(H.dstride[il]>md)md=H.dstride[il]; }
         auto rup=[](size_t v){ return (v+8192+4095)&~(size_t)4095; }; gbsz=rup(mg); ubsz=rup(mu); dbsz=rup(md);
         fprintf(stderr,"[directIO] 8 workers, reads land DIRECTLY in aligned RT buffers (no scratch/memcpy); buf g/u/d=%zu/%zu/%zu KB\n",gbsz/1024,ubsz/1024,dbsz/1024); }
@@ -319,6 +330,11 @@ int main(int argc,char**argv){
     std::set<int> touched;                 // distinct (il*n_expert+e) selected = WORKING SET
     bool trace=getenv("TRACE")!=nullptr;   // log per-(token,layer) selection -> prefetch-predictor ceiling
     std::vector<std::vector<std::vector<int>>> seltrace;   // [decode_tok][layer] = selected experts
+    // --- benchmark instrumentation (all env-gated; a normal run sets none of these, so behaviour is unchanged) ---
+    double throttle_Bps = getenv("THROTTLE_MBPS") ? atof(getenv("THROTTLE_MBPS"))*1e6 : 0.0; // simulate a slower drive
+    const char* csvpath = getenv("CSV"); FILE* csvf=nullptr;                                  // per-token metrics CSV
+    if(csvpath){ csvf=fopen(csvpath,"w"); if(csvf) fprintf(csvf,"tok,t_ms,dt_ms,vram_hit,ram_hit,nvme_fall,reqs,distinct,disk_mb\n"); }
+    long long tok_first_ns=0, tok_prev_ns=0;   // per-token wall-clock -> hit-rate-over-time + latency percentiles
     size_t vram = ggml_backend_buffer_get_size(M.wbuf)+ggml_backend_buffer_get_size(kv.buf)+ggml_backend_buffer_get_size(S.buf);
 
     // fetch expert (il,e) bytes into the RAM tier; return RAM slot. RAM hit or NVMe fall-through.
@@ -368,7 +384,8 @@ int main(int argc,char**argv){
                 ggml_context* g=ggml_init({(size_t)256*1024*1024,nullptr,true});
                 ggml_cgraph* gf=ggml_new_graph_custom(g,8192,false);
                 ggml_tensor* ix=ggml_new_tensor_2d(g,GGML_TYPE_F32,n_embd,1); ggml_set_input(ix);
-                ggml_tensor* ip=ggml_new_tensor_1d(g,GGML_TYPE_I32,is_qwen35?4:1); ggml_set_input(ip); // mrope: 4 pos/token
+                bool mrope=(is_qwen35 && !is_qwen3next);                         // qwen35moe uses IMRoPE (4 pos/token); qwen3next & others 1
+                ggml_tensor* ip=ggml_new_tensor_1d(g,GGML_TYPE_I32,mrope?4:1); ggml_set_input(ip);
                 ggml_tensor* xn=ggml_mul(g,ggml_rms_norm(g,ix,eps),M.blk(il,"attn_norm.weight"));
                 ggml_tensor* att; ggml_tensor* extra1=nullptr; ggml_tensor* extra2=nullptr; // state writebacks
                 if(!is_recr[il]){
@@ -382,9 +399,14 @@ int main(int argc,char**argv){
                     ggml_tensor* Kc=ggml_reshape_3d(g,ggml_mul_mat(g,M.blk(il,"attn_k.weight"),xn),head_dim,n_head_kv,1);
                     Kc=ggml_mul(g,ggml_rms_norm(g,Kc,eps),M.blk(il,"attn_k_norm.weight"));
                     ggml_tensor* Vc=ggml_reshape_3d(g,ggml_mul_mat(g,M.blk(il,"attn_v.weight"),xn),head_dim,n_head_kv,1);
-                    int sec[4]={rope_sections[0],rope_sections[1],rope_sections[2],rope_sections[3]};
-                    Qc=ggml_rope_multi(g,Qc,ip,nullptr,64,sec,GGML_ROPE_TYPE_IMROPE,n_ctx_orig,freq_base,1,0,1,32,1);
-                    Kc=ggml_rope_multi(g,Kc,ip,nullptr,64,sec,GGML_ROPE_TYPE_IMROPE,n_ctx_orig,freq_base,1,0,1,32,1);
+                    if(is_qwen3next){ // NEOX rope, rope.dimension_count=64 (partial: first 64 of 256-dim head), 1 pos/token
+                        Qc=ggml_rope_ext(g,Qc,ip,nullptr,64,GGML_ROPE_TYPE_NEOX,n_ctx_orig,freq_base,1,0,1,32,1);
+                        Kc=ggml_rope_ext(g,Kc,ip,nullptr,64,GGML_ROPE_TYPE_NEOX,n_ctx_orig,freq_base,1,0,1,32,1);
+                    } else {          // qwen35moe: multi-section IMRoPE (4 pos/token)
+                        int sec[4]={rope_sections[0],rope_sections[1],rope_sections[2],rope_sections[3]};
+                        Qc=ggml_rope_multi(g,Qc,ip,nullptr,64,sec,GGML_ROPE_TYPE_IMROPE,n_ctx_orig,freq_base,1,0,1,32,1);
+                        Kc=ggml_rope_multi(g,Kc,ip,nullptr,64,sec,GGML_ROPE_TYPE_IMROPE,n_ctx_orig,freq_base,1,0,1,32,1);
+                    }
                     ggml_tensor* kc=kv.k[il]; ggml_tensor* vc=kv.v[il];
                     ggml_tensor* dk=ggml_view_3d(g,kc,head_dim,n_head_kv,1,kc->nb[1],kc->nb[2],(size_t)p*kc->nb[2]);
                     ggml_tensor* dv=ggml_view_3d(g,vc,head_dim,n_head_kv,1,vc->nb[1],vc->nb[2],(size_t)p*vc->nb[2]);
@@ -407,9 +429,19 @@ int main(int argc,char**argv){
                     int Sv=gdn_Sv,Hv=gdn_Hv,Hk=gdn_Hk,kd=gdn_key_dim,vd=gdn_val_dim,cd=gdn_conv_dim;
                     ggml_tensor* qkv=ggml_mul_mat(g,M.blk(il,"attn_qkv.weight"),xn);    // [cd=8192,1]
                     ggml_tensor* z=ggml_mul_mat(g,M.blk(il,"attn_gate.weight"),xn);     // [vd=4096,1]
-                    ggml_tensor* beta=ggml_sigmoid(g,ggml_mul_mat(g,M.blk(il,"ssm_beta.weight"),xn));     // [Hv]
+                    ggml_tensor* beta; ggml_tensor* al;
+                    if(is_qwen3next){ // fused ssm_ba [2*Hv]: layout is per k-head [vpg betas][vpg alphas] x Hk -> de-interleave
+                        int vpg=Hv/Hk;                                                              // value heads per k-head group (2)
+                        ggml_tensor* ba=ggml_reshape_2d(g,ggml_mul_mat(g,M.blk(il,"ssm_ba.weight"),xn),vpg*2,Hk); // [4,Hk]
+                        ggml_tensor* br=ggml_cont(g,ggml_view_2d(g,ba,vpg,Hk,ba->nb[1],0));                       // betas  -> [vpg,Hk]
+                        ggml_tensor* ar=ggml_cont(g,ggml_view_2d(g,ba,vpg,Hk,ba->nb[1],(size_t)vpg*ggml_element_size(ba))); // alphas
+                        beta=ggml_sigmoid(g,ggml_reshape_2d(g,br,Hv,1));
+                        al  =ggml_reshape_2d(g,ar,Hv,1);
+                    } else {          // qwen35moe: separate ssm_beta / ssm_alpha projections
+                        beta=ggml_sigmoid(g,ggml_mul_mat(g,M.blk(il,"ssm_beta.weight"),xn));     // [Hv]
+                        al  =ggml_mul_mat(g,M.blk(il,"ssm_alpha.weight"),xn);                     // [Hv]
+                    }
                     beta=ggml_reshape_4d(g,beta,1,Hv,1,1);
-                    ggml_tensor* al=ggml_mul_mat(g,M.blk(il,"ssm_alpha.weight"),xn);    // [Hv]
                     al=ggml_softplus(g,ggml_add(g,al,M.blk(il,"ssm_dt.bias")));
                     ggml_tensor* gg=ggml_reshape_4d(g,ggml_mul(g,al,M.blk(il,"ssm_a")),1,Hv,1,1);         // decay
                     // causal conv1d over [conv_state(3) ++ new(1)] then silu
@@ -423,6 +455,11 @@ int main(int argc,char**argv){
                     ggml_tensor* kc2=ggml_l2_norm(g,ggml_cont(g,ggml_view_3d(g,convo,Sv,Hk,1,cz*Sv,cz*kd,cz*kd)),eps);
                     ggml_tensor* vc2=ggml_cont(g,ggml_view_3d(g,convo,Sv,Hv,1,cz*Sv,cz*vd,cz*kd*2));
                     qc=ggml_reshape_4d(g,qc,Sv,Hk,1,1); kc2=ggml_reshape_4d(g,kc2,Sv,Hk,1,1); vc2=ggml_reshape_4d(g,vc2,Sv,Hv,1,1);
+                    // qwen3next explicitly repeat-interleaves q/k from Hk to Hv heads BEFORE the fused GDN ([g0,g0,g1,g1,...]).
+                    // qwen35moe does NOT (its fused path relies on the op's internal broadcast) -> gate strictly on arch, NOT on Hv!=Hk.
+                    if(is_qwen3next && Hv!=Hk){ int vpg=Hv/Hk;
+                        qc =ggml_reshape_4d(g,ggml_repeat_4d(g,ggml_reshape_4d(g,qc ,Sv,1,Hk,1),Sv,vpg,Hk,1),Sv,Hv,1,1);
+                        kc2=ggml_reshape_4d(g,ggml_repeat_4d(g,ggml_reshape_4d(g,kc2,Sv,1,Hk,1),Sv,vpg,Hk,1),Sv,Hv,1,1); }
                     ggml_tensor* s0=ggml_reshape_4d(g,gdn_state[il],Sv,Sv,Hv,1);
                     ggml_tensor* gdn=ggml_gated_delta_net(g,qc,kc2,vc2,gg,beta,s0,1);
                     size_t rs1=ggml_row_size(gdn->type,Sv);
@@ -446,7 +483,7 @@ int main(int argc,char**argv){
                 if(extra2) ggml_build_forward_expand(gf,extra2);
                 ggml_gallocr_alloc_graph(galloc,gf);
                 ggml_backend_tensor_set(ix,x.data(),0,(size_t)n_embd*4);
-                if(!is_recr[il]){ int32_t pp[4]={p,p,p,p}; ggml_backend_tensor_set(ip,pp,0,(is_qwen35?4:1)*4); } // mrope positions (4 sections, all = p for text)
+                if(!is_recr[il]){ int32_t pp[4]={p,p,p,p}; ggml_backend_tensor_set(ip,pp,0,(mrope?4:1)*4); } // mrope: 4 sections all=p (text); else single pos
                 ggml_backend_graph_compute(backend,gf);
                 ggml_backend_tensor_get(fx,ffnx.data(),0,(size_t)n_embd*4);
                 ggml_backend_tensor_get(ffn_inp,ffninp.data(),0,(size_t)n_embd*4);
@@ -490,7 +527,13 @@ int main(int argc,char**argv){
                 struct timespec d0,d1; clock_gettime(CLOCK_MONOTONIC,&d0);
                 run_jobs(io,jobs);
                 clock_gettime(CLOCK_MONOTONIC,&d1);
-                { long long _dd=(d1.tv_sec-d0.tv_sec)*1000000000LL+(d1.tv_nsec-d0.tv_nsec); disk_ns+=_dd; if(p>=T) tDisk+=_dd; }
+                { long long _dd=(d1.tv_sec-d0.tv_sec)*1000000000LL+(d1.tv_nsec-d0.tv_nsec); disk_ns+=_dd; if(p>=T) tDisk+=_dd;
+                  // storage-bandwidth throttle: cap effective drive speed by sleeping out the rest of this batch's
+                  // budget. Gated to the timed decode region (p>=T) so one-time prefill cold-load isn't throttled.
+                  if(throttle_Bps>0 && p>=T){ size_t bb=0; for(auto&jb:jobs) bb+=jb.rsize;
+                      if(bb>0){ long long tgt=(long long)((double)bb/throttle_Bps*1e9), slp=tgt-_dd;
+                          if(slp>0){ struct timespec ts{(time_t)(slp/1000000000LL),(long)(slp%1000000000LL)}; nanosleep(&ts,nullptr);
+                              disk_ns+=slp; if(p>=T) tDisk+=slp; } } } }
                 for(auto&jb:jobs) disk_bytes += jb.rsize;
                 // Phase C (serial): stage RAM->VRAM (ggml/Vulkan backend is single-threaded)
                 for(int j=0;j<n_used;++j){ if(vhit[j]) continue; int e=sel[j], rs=ramslot[j];
@@ -563,12 +606,16 @@ int main(int argc,char**argv){
             }
             int bi=0; float bv=logits[0]; for(int v=1;v<n_vocab;++v) if(logits[v]>bv){bv=logits[v];bi=v;}
             gen.push_back(bi); on_token(bi);
+            if(csvf){ long long now=NOW(); if(!tok_first_ns) tok_first_ns=now;
+                double t_ms=(now-tok_first_ns)/1e6, dt_ms=tok_prev_ns?(now-tok_prev_ns)/1e6:0; tok_prev_ns=now;
+                fprintf(csvf,"%zu,%.3f,%.3f,%ld,%ld,%ld,%ld,%zu,%.3f\n",
+                    gen.size(),t_ms,dt_ms,vram_hit,ram_hit,nvme_fall,reqs,touched.size(),disk_bytes/1e6); fflush(csvf); }
             if(mode!="chat" && gen.size()%16==0) // saturation curve: cumulative distinct experts vs token position
                 fprintf(stderr,"[ws@%3zu tok] %4zu distinct experts (%.1f%% of model, %.0f MB)\n",
                     gen.size(),touched.size(),100.0*touched.size()/(double)(n_layer*n_expert),
                     [&]{double mb=0;for(int key:touched)mb+=H.gstride[key/n_expert]+H.ustride[key/n_expert]+H.dstride[key/n_expert];return mb/1e6;}());
             if(tf){ if(p+1>=(int)seq.size()) break; }              // teacher-force: follow given seq
-            else { if((int)gen.size()>=ngen||bi==eos_id) break; seq.push_back(bi); }
+            else { static const bool noeos=getenv("NOEOS")!=nullptr; if((int)gen.size()>=ngen||(bi==eos_id&&!noeos)) break; seq.push_back(bi); } // NOEOS: keep generating to ngen (context-scaling bench)
         }
     }
     clock_gettime(CLOCK_MONOTONIC,&t1);
@@ -584,15 +631,17 @@ int main(int argc,char**argv){
         auto respond=[&](const std::string& msg){
             // qwen3.5: disable thinking by pre-filling an empty <think></think> block (enable_thinking=false).
             // qwen3: the /no_think soft switch works. Either way -> concise answers, not 1k tokens of hidden reasoning.
-            std::string turn = is_qwen35
-                ? "<|im_start|>user\n"+msg+"<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
-                : "<|im_start|>user\n"+msg+" /no_think<|im_end|>\n<|im_start|>assistant\n";
+            std::string turn = is_qwen3next
+                ? "<|im_start|>user\n"+msg+"<|im_end|>\n<|im_start|>assistant\n"                       // qwen3next-Instruct: no thinking, plain turn
+                : is_qwen35
+                ? "<|im_start|>user\n"+msg+"<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"  // qwen3.5: empty <think> = thinking off
+                : "<|im_start|>user\n"+msg+" /no_think<|im_end|>\n<|im_start|>assistant\n";             // qwen3: /no_think soft switch
             int32_t need=llama_tokenize(vocab,turn.c_str(),(int)turn.size(),nullptr,0,false,true);
             std::vector<llama_token> tt(need<0?-need:need);
             llama_tokenize(vocab,turn.c_str(),(int)turn.size(),tt.data(),(int)tt.size(),false,true);
             std::vector<int32_t> sq=hist; for(auto t:tt) sq.push_back((int32_t)t);
             int Tp=(int)sq.size();
-            int think_open=is_qwen35?248068:151667, think_close=is_qwen35?248069:151668; // <think>/</think> ids
+            int think_open=(is_qwen35&&!is_qwen3next)?248068:151667, think_close=(is_qwen35&&!is_qwen3next)?248069:151668; // <think>/</think> ids (qwen35moe vocab vs standard Qwen)
             gen.clear(); bool inthink=false; printf("\n");
             generate(sq,Tp,1024,[&](int id){
                 if(id==think_open){inthink=true;return;} if(id==think_close){inthink=false;return;}  // hide <think>...</think>
@@ -619,6 +668,7 @@ int main(int argc,char**argv){
 
     // ---- one-shot generation (benchmark / validation) ----
     generate(seq,T,ngen,[](int){});
+    if(csvf) fclose(csvf);
     double secs=(t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)/1e9;
     vram += peak_compute;
 

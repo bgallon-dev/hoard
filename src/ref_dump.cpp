@@ -31,6 +31,10 @@ static bool want(const char* name) {
         // kqv_out-0 is the PRE-RESIDUAL attention output (unmasked by the skip connection).
         "kq-0", "kq_soft_max-0", "kqv-0", "kqv_out-0",
         "ffn_inp-0", "ffn_norm-0", "ffn_moe_out-0", "l_out-", "result_norm", "result_output",
+        // per-layer split to localize the massive activation: attn residual vs moe output
+        "attn_residual-", "ffn_out-", "post_moe-",
+        // routed vs shared expert split
+        "ffn_moe_out-", "ffn_shexp_gated-", "ffn_shexp-", "ffn_moe_logits-", "attn_post_norm-", "linear_attn_out-",
     };
     for (const char* s : subs) if (strstr(name, s)) return true;
     return false;
@@ -87,8 +91,8 @@ int main(int argc, char** argv) {
     ggml_backend_dev_t devs[2] = { vk0, nullptr };
 
     llama_model_params mp = llama_model_default_params();
-    mp.n_gpu_layers = 99;
-    if (vk0) mp.devices = devs;
+    mp.n_gpu_layers = 0;          // CPU reference (80B won't fit 8GB; match the gold CPU oracle numerics)
+    (void)devs; (void)vk0;
     llama_model* model = llama_model_load_from_file(argv[1], mp);
     if (!model) { fprintf(stderr, "model load failed\n"); return 1; }
 
@@ -100,8 +104,8 @@ int main(int argc, char** argv) {
     llama_context* ctx = llama_init_from_model(model, cp);
     if (!ctx) { fprintf(stderr, "ctx init failed\n"); return 1; }
 
-    // France prompt (instruct-templated, 15 tokens) captured from llama-completion --verbose-prompt
-    llama_token toks[] = {29,93,4537,49651,187,510,5347,273,6181,310,29,93,515,5567,49651};
+    // single token "The" (785) — matches the engine's pos0 (TFLEN=1) for per-layer l_out comparison
+    llama_token toks[] = {785};
     int n = (int)(sizeof(toks)/sizeof(toks[0]));
     llama_batch batch = llama_batch_get_one(toks, n);
 

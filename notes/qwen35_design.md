@@ -37,3 +37,22 @@ verify whether it's GGML_OP_ROPE + sections mode (Vulkan has ROPE) or needs a fa
 
 ## Per-expert size (streamable): gate/up [2048,512] + down [512,2048] ~1.7 MB/expert; 256x40 ~17 GB experts.
 Same cliff regime as Qwen3-30B (A3B, ~3B active) -> expect ~similar tok/s once streaming wired.
+
+## Qwen3-Next-80B-A3B port (qwen3next arch) — TODO when model downloads (~45 GB)
+Reuses the qwen35moe GDN engine. Differences to handle (gated on arch=="qwen3next"):
+- qkvz: new GGUF uses attn_qkv + attn_gate (SAME as qwen35moe). legacy uses fused ssm_in (split). Confirm via gguf_dump.
+- ssm_ba (LLM_TENSOR_SSM_BETA_ALPHA, fused) -> split into beta[0:num_v_heads] + alpha[num_v_heads:] (vs qwen35moe separate ssm_beta/ssm_alpha).
+- full-attn RoPE: ggml_rope_ext (NEOX) NOT rope_multi/IMRoPE -> simpler, ip=[p] (1 pos), like qwen3moe.
+- hparams (generic read): 48 layers, 512 experts / 10 active, hidden 2048, head_dim 256, GQA 16/2.
+- F<B holds (10*48*~1.7MB = ~0.8 GB/token active < VRAM budget) -> persistent slot cache works, NO slot redesign needed.
+Same: ssm_conv, ssm_a/dt/norm/out, gated norm, MoE 512/10 (stream), gated shared expert, recurrent state infra.
+
+## Qwen3-Next-80B-A3B PORT -- DONE, validated 16/16 (see notes/STATUS.md "M6")
+Confirmed via gguf_dump: NEW format (attn_qkv+attn_gate, fused ssm_ba [2048,64], rope.dimension_count=64 NEOX,
+NO rope.dimension_sections, NO full_attention_interval key -> default 4). Implemented in run_qwen35.cpp gated on
+is_qwen3next (arch=="qwen3next"): ssm_ba de-interleave, ggml_rope_ext NEOX (1 pos), plain chat turn (Instruct).
+*** THE NON-OBVIOUS BUG ***: qwen3next ALWAYS repeat-interleaves q/k Hk(16)->Hv(32) before ggml_gated_delta_net;
+qwen35moe does NOT (fused path uses the op's internal broadcast). So gate the repeat on arch==qwen3next ONLY --
+NOT on Hv!=Hk (that repeats for qwen35moe too and breaks it 252->15/256). Without it: 80B logits ~0.5x compressed
+(GDN 0.844x/layer compounding), 10/16. With it: 16/16. Also: BF16 ffn_gate_inp_shexp -> upconvert to f32 (RX6600
+bf16:0; turned out bit-identical but kept). Found by per-layer cosine/norm diff vs CPU ref_dump (src/ref_dump.cpp).

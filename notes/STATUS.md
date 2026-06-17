@@ -333,3 +333,45 @@ chat35.ps1 (project root): runs run_qwen35.exe on the Qwen3.5 model, K=48 + 2048
 hash map" it spent 1024 tokens thinking and hit the cap before answering (suppressed -> empty output). FIX:
 disable thinking by pre-filling an empty <think></think> in the assistant prompt (enable_thinking=false). Now:
 concise visible answers, ~7.6 tok/s at K=48 (peak VRAM fits 8 GB; chat KV is only 10 full-attn layers x max_kv 4096).
+
+## RECURRENCE DRIFT: 256-position teacher-forced oracle (closes the GDN footnote)
+Setup: llama.cpp CPU oracle generated a 256-token NON-degenerate answer (stack-vs-queue explanation, not a
+repetition loop) -> oref256.{txt,log}. Teacher-forced the engine on the same 23-prompt+256-gen=279 id seq
+(TFLEN=23, K=48/RAM=2048), dumped top-5 logits/pos, diffed vs oracle. (Build harness: seq256.csv, eng256.err.)
+RESULT: top-1 agreement 252/256 = 98.4%. ALL 4 misses are model near-ties: at pos 50/99/217/225 the oracle's
+OWN top1-vs-top2 gap was 0.012/0.041/0.079/0.007 logits -> a sub-0.1 CPU-vs-Vulkan FP diff flips a coin-flip
+argmax (re-running the oracle with other threading flips them too). Not drift.
+DRIFT (the real question - does per-step error compound?): NO. Mean |delta logit| by 32-pos block:
+ 0-31:0.115  32-63:0.104  64-95:0.131  96-127:0.115  128-159:0.154  160-191:0.167  192-223:0.196  224-255:0.178.
+Grows ~0.11 -> ~0.20 then PLATEAUS and turns back down = sublinear, bounded. Signature of a CONTRACTIVE
+decay-gated recurrence: GDN gate alpha=softplus(.)*ssm_a < 1 forgets old error faster than new error accrues,
+so FP noise saturates into a ~0.2-logit band instead of running away. Distribution: mean 0.145, median 0.102,
+p90 0.284, p99 1.275, max 1.365 (vs logits of magnitude 20-36 -> ~0.3% of signal). HONEST BOUNDARY: token-exact
+validated to 256 state updates; the SATURATION (not the count) is the evidence the recurrence is numerically
+stable and is what extrapolates past 256 - NOT proven token-exact to the 262K-context ceiling.
+(Re-validated post-qwen3next-fix below: still 252/256, mean 0.145 - bit-identical, the arch-gated GDN fix does not touch qwen35moe.)
+
+## M6: Qwen3-Next-80B-A3B (qwen3next arch) - same engine, validated 16/16
+Ported run_qwen35.cpp to also run qwen3next (80B total / ~3B active, 48 layers: 36 GDN-linear + 12 full-attn,
+512 experts/top-10 + shared expert, head_dim 256). One binary, dispatched on the GGUF arch string.
+DELTAS vs qwen35moe: (a) fused ssm_ba [2*Hv] split into beta/alpha by de-interleave (per k-head [vpg b][vpg a]);
+(b) full-attn rope = ggml_rope_ext NEOX n_rot=64 (NOT IMRoPE/rope_multi), 1 pos/token; (c) full_attn_interval key
+absent -> default 4 (same (il+1)%4 rule); (d) standard Qwen vocab 151936, eos 151645, Instruct (no <think>).
+TWO BUGS found via per-layer activation diff vs a CPU ref_dump (the decisive tool - dumps llama.cpp's per-layer
+l_out / attn_residual / ffn_shexp stats + .bin vectors; compared cosine + norm ratio engine-vs-ref per layer):
+ BUG 1 (the real one): ggml_gated_delta_net q/k head broadcast. qwen3next.cpp ALWAYS repeat-interleaves q/k
+   from Hk=16 to Hv=32 heads ([g0,g0,g1,g1,...]) BEFORE the fused GDN; qwen35moe.cpp does NOT (its fused path
+   relies on the op's internal broadcast - `repeat only if !fused`). Without the repeat the 80B GDN was cosine
+   0.994 but only 0.844x magnitude -> compounded over 36 GDN layers into a uniform ~0.5x logit COMPRESSION and a
+   collapsed massive-activation (the shared expert's -68 attention-sink dim came out ~1/3). MUST gate the repeat
+   on arch==qwen3next, NOT on Hv!=Hk: gating on Hv!=Hk also repeats for qwen35moe and CRASHED it to 15/256.
+ BUG 2 (latent, harmless here): ffn_gate_inp_shexp is BF16 in the 80B (F32 in the 35B) and the RX 6600 reports
+   bf16:0 -> upconvert bf16->f32 on load for all non-expert tensors. Turned out bit-identical (Vulkan handled it)
+   but kept as a correctness guard.
+LOCALIZATION TRAIL (how, not just what): per-layer |x| ratio engine/ref was ~0.9 through L5 then dropped to ~0.47
+at L6 and stayed -> L6 = first big massive activation. Split L6 -> MoE-driven (routed 0.26 vs shared 19.8) ->
+shared expert -> ungated FFN 0.44x + gate 0.74x -> input fx cosine 0.955, att+res cosine 0.97 mag 0.70 -> GDN
+attn cosine 0.994 mag 0.844 -> the q/k repeat made it 1.000/1.001 exactly.
+VALIDATED: 80B teacher-forced 16/16 top-1 vs CPU oracle, |dL1| ~0.05-0.96 (FP-level, same as 35B). Chat works:
+"capital of France + landmark" -> "Paris ... Eiffel Tower" @ 4.29 tok/s, 80B on 8 GB. Launcher: chatnext.ps1.
+This is the most powerful model the engine runs at usable speed (A3B keeps it fast; bigger-active would crawl).
