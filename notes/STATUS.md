@@ -300,3 +300,36 @@ Build now links llama:  g++ ... -I reference/llama.cpp-src/include ... llama.dll
 VALIDATED: one-shot OLMoE still 8/8 bit-exact (refactor safe). Chat on Qwen3-30B: correct streamed code review at
 ~6 tok/s, caught both planted bugs (i<=n OOB, malloc(n) vs n*sizeof(int)) + missing NULL check. The engine is now
 a usable private local 30B-class streaming code reviewer on the 8 GB RX 6600.
+
+## MILESTONE 5 COMPLETE: Qwen3.5-35B-A3B hybrid linear-attention (src/run_qwen35.cpp)
+The frontier arch: qwen35moe = 40 layers (30 Gated Delta Net LINEAR + 10 gated FULL attention) + 256/8 MoE
++ shared expert. Forked run_moe_stream; reused 3-tier streaming + device-direct I/O + chat REPL.
+P1 full-attn: fused Q+gate proj (attn_q double-width, view-split), per-head q/k RMS-norm (head_dim 256),
+  IMRoPE (ggml_rope_multi, mode 40, sections [11,11,10,0], 4 pos/token), GQA 16/2, sigmoid gate on attn out.
+P2 recurrent state: per-linear-layer GDN state [128,128,32] + conv window [3,8192], persistent VRAM, zeroed/gen.
+P3 GDN: attn_qkv/attn_gate proj -> ssm_conv (causal conv1d + silu, rolling conv state) -> l2_norm q/k ->
+  decay g=softplus(ssm_alpha.x+ssm_dt)*ssm_a, beta=sigmoid(ssm_beta.x) -> FUSED ggml_gated_delta_net(q,k,v,g,b,
+  state,K=1) [on Vulkan!] -> gated RMS-norm(out,z) -> ssm_out. Single-token recurrence (no chunked scan needed).
+P4: routed 256/8 (streamed, same cache) + gated shared expert ffn_*_shexp (sigmoid(gate_inp_shexp)*down(silu*up)).
+P5 VALIDATED: token-for-token vs llama.cpp oracle = 6/6 EXACT ("The capital of France is" -> 11751 13 198 760
+  6511 314). Runs ~5 tok/s streaming experts from NVMe. The engine now runs the CURRENT frontier architecture.
+BUGS FOUND (curriculum): (1) ip (positions) unused in linear layers -> galloc didn't allocate -> tensor_set
+  crash; guard set only for full-attn. (2) IMRoPE needs 4 positions/token (mrope sections), not 1.
+KEY: my per-position engine makes GDN a single-step recurrence -> the fused ggml_gated_delta_net op (Vulkan)
+  does it directly; no need to port the chunked delta-rule scan. All ops (ssm_conv/l2_norm/softplus/gdn/imrope) on Vulkan.
+
+## M5 chat robustness fix
+Chat (long generation) hit ggml.c:1751 view-out-of-bounds: full-attn KV cache was sized max_kv=T+ngen+2
+(=1026 for chat) but a long <think> trace ran past it. Fix: max_kv=4096 for chat + only allocate KV for the
+10 full-attn layers (qwen35: linear layers use recurrent state, not KV -> saves VRAM) + clean stop at max_kv-1.
+One-shot stays 6/6 exact. Chat now completes (e.g. 189 tok @ 4 tok/s, no crash). Open cosmetic: qwen35 <think>
+tokens differ from Qwen3's (151667/8) so the REPL's think-suppression doesn't catch them (different vocab).
+
+## CHAT WIRED to Qwen3.5-35B (chat35.ps1 launcher)
+chat35.ps1 (project root): runs run_qwen35.exe on the Qwen3.5 model, K=48 + 2048-expert RAM tier defaults
+(.\chat35.ps1 [K] [Ram] to override). Runs from build/ so DLLs load. NOTE: don't set ErrorActionPreference=Stop
+(engine stderr would abort it). Fixes for usability: (1) <think> suppression uses qwen3.5 ids 248068/248069
+(not qwen3's 151667/8). (2) Qwen3.5 ignores the /no_think soft switch and is a heavy thinker -> for "what is a
+hash map" it spent 1024 tokens thinking and hit the cap before answering (suppressed -> empty output). FIX:
+disable thinking by pre-filling an empty <think></think> in the assistant prompt (enable_thinking=false). Now:
+concise visible answers, ~7.6 tok/s at K=48 (peak VRAM fits 8 GB; chat KV is only 10 full-attn layers x max_kv 4096).

@@ -20,6 +20,9 @@ docs/
 *.log
 *.zip
 *.bin
+*.err
+cl.out
+d.out
 bench/
 # binary reference-activation dumps (validation scratch)
 notes/ref_acts/
