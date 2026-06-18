@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hoard chat</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --user:#2a3344; --asst:#1c2029; --tx:#e6e8ee; --mut:#8b93a3; --acc:#5b9dff; --code:#0b0d11; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--tx); font:15px/1.55 -apple-system,Segoe UI,Roboto,sans-serif; }
+  #app { display:flex; flex-direction:column; height:100%; max-width:820px; margin:0 auto; }
+  textarea.drag { border-color:var(--acc); background:#1a2230; }
+  header { display:flex; align-items:center; gap:10px; padding:12px 16px; border-bottom:1px solid #232733; }
+  header .dot { width:9px; height:9px; border-radius:50%; background:#caa53a; box-shadow:0 0 6px #caa53a; }
+  header .dot.ready { background:#43c463; box-shadow:0 0 6px #43c463; }
+  header h1 { font-size:15px; margin:0; font-weight:600; }
+  header .sub { color:var(--mut); font-size:12px; }
+  header .grow { flex:1; }
+  button { background:var(--panel); color:var(--tx); border:1px solid #2c3240; border-radius:8px; padding:7px 12px; cursor:pointer; font-size:13px; }
+  button:hover { border-color:var(--acc); }
+  #log { flex:1; overflow-y:auto; padding:18px 16px; display:flex; flex-direction:column; gap:14px; }
+  .msg { max-width:88%; padding:10px 14px; border-radius:12px; white-space:normal; word-wrap:break-word; }
+  .msg.user { align-self:flex-end; background:var(--user); border-bottom-right-radius:3px; }
+  .msg.asst { align-self:flex-start; background:var(--asst); border-bottom-left-radius:3px; }
+  .msg p { margin:0 0 8px; } .msg p:last-child { margin-bottom:0; }
+  .msg pre { background:var(--code); border:1px solid #232733; border-radius:8px; padding:10px 12px; overflow-x:auto; margin:8px 0; }
+  .msg code { background:#000a; padding:1px 5px; border-radius:4px; font-size:13px; }
+  .msg pre code { background:none; padding:0; }
+  .msg ul,.msg ol { margin:6px 0; padding-left:22px; } .msg li { margin:2px 0; }
+  .msg h1,.msg h2,.msg h3 { margin:10px 0 6px; font-size:1.05em; }
+  .cursor::after { content:"█"; color:var(--acc); animation:blink 1s steps(2) infinite; }
+  @keyframes blink { 50%{opacity:0;} }
+  footer { padding:10px 16px 14px; border-top:1px solid #232733; }
+  .row { display:flex; gap:8px; align-items:flex-end; }
+  textarea { flex:1; resize:none; background:var(--panel); color:var(--tx); border:1px solid #2c3240; border-radius:10px; padding:10px 12px; font:inherit; max-height:160px; }
+  textarea:focus { outline:none; border-color:var(--acc); }
+  .send { background:var(--acc); border-color:var(--acc); color:#04101f; font-weight:600; }
+  .perf { color:var(--mut); font-size:11.5px; margin-top:6px; height:14px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <span class="dot" id="dot"></span>
+    <div><h1 id="title">hoard</h1><div class="sub" id="sub">connecting…</div></div>
+    <span class="grow"></span>
+    <button id="attach">Attach file</button>
+    <button id="newchat">New chat</button>
+  </header>
+  <input type="file" id="fileinput" hidden>
+  <div id="log"></div>
+  <footer>
+    <div class="row">
+      <textarea id="box" rows="1" placeholder="Message the model…  (Enter to send, Shift+Enter for newline)"></textarea>
+      <button class="send" id="send">Send</button>
+    </div>
+    <div class="perf" id="perf"></div>
+  </footer>
+</div>
+<script>
+const log=document.getElementById('log'), box=document.getElementById('box'), perf=document.getElementById('perf');
+const dot=document.getElementById('dot'), sub=document.getElementById('sub'), title=document.getElementById('title');
+let busy=false, ready=false;
+
+function esc(s){ return s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+// minimal markdown: fenced code, inline code, bold, headers, lists, paragraphs (input is HTML-escaped first)
+function md(src){
+  const lines=src.split('\n'); let out=[], i=0;
+  const inline=t=>esc(t).replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
+  while(i<lines.length){
+    let l=lines[i];
+    if(/^```/.test(l)){ let code=[]; i++; while(i<lines.length && !/^```/.test(lines[i])) code.push(lines[i++]); i++;
+      out.push('<pre><code>'+esc(code.join('\n'))+'</code></pre>'); continue; }
+    if(/^#{1,6}\s/.test(l)){ out.push('<h3>'+inline(l.replace(/^#{1,6}\s/,''))+'</h3>'); i++; continue; }
+    if(/^\s*[-*]\s/.test(l)){ let it=[]; while(i<lines.length && /^\s*[-*]\s/.test(lines[i])) it.push('<li>'+inline(lines[i++].replace(/^\s*[-*]\s/,''))+'</li>');
+      out.push('<ul>'+it.join('')+'</ul>'); continue; }
+    if(/^\s*\d+\.\s/.test(l)){ let it=[]; while(i<lines.length && /^\s*\d+\.\s/.test(lines[i])) it.push('<li>'+inline(lines[i++].replace(/^\s*\d+\.\s/,''))+'</li>');
+      out.push('<ol>'+it.join('')+'</ol>'); continue; }
+    if(l.trim()===''){ i++; continue; }
+    let para=[]; while(i<lines.length && lines[i].trim()!=='' && !/^(```|#{1,6}\s|\s*[-*]\s|\s*\d+\.\s)/.test(lines[i])) para.push(lines[i++]);
+    out.push('<p>'+inline(para.join('\n')).replace(/\n/g,'<br>')+'</p>');
+  }
+  return out.join('');
+}
+function bubble(cls){ const d=document.createElement('div'); d.className='msg '+cls; log.appendChild(d); log.scrollTop=log.scrollHeight; return d; }
+
+async function poll(){
+  try{ const s=await (await fetch('/api/status')).json();
+    title.textContent=s.name; ready=s.ready;
+    dot.classList.toggle('ready',ready); sub.textContent = ready ? `K=${s.k} · ${s.ram}-expert RAM tier · experts streaming from NVMe` : 'loading model…';
+  }catch(e){ sub.textContent='server offline'; }
+  if(!ready) setTimeout(poll,1200);
+}
+poll();
+
+async function send(){
+  const text=box.value.trim(); if(!text||busy||!ready) return;
+  busy=true; box.value=''; box.style.height='auto'; perf.textContent='';
+  bubble('user').innerHTML=md(text);
+  const b=bubble('asst'); b.classList.add('cursor'); let raw='';
+  const t0=performance.now();
+  try{
+    const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text})});
+    const rd=r.body.getReader(), dec=new TextDecoder(); let buf='';
+    while(true){ const {value,done}=await rd.read(); if(done) break; buf+=dec.decode(value,{stream:true});
+      let parts=buf.split('\n\n'); buf=parts.pop();
+      for(const p of parts){ if(!p.startsWith('data: ')) continue; const j=JSON.parse(p.slice(6));
+        if(j.delta){ raw+=j.delta; b.innerHTML=md(raw); log.scrollTop=log.scrollHeight; }
+        if(j.done){ perf.textContent=`${j.tokens} tokens · ${j.tok_s} tok/s · ${j.secs}s`; } } }
+  }catch(e){ raw+='\n\n_[connection error]_'; b.innerHTML=md(raw); }
+  b.classList.remove('cursor'); busy=false; box.focus();
+}
+document.getElementById('send').onclick=send;
+document.getElementById('newchat').onclick=async()=>{ await fetch('/api/reset',{method:'POST'}); log.innerHTML=''; perf.textContent=''; box.focus(); };
+box.addEventListener('keydown',e=>{ if(e.key==='Enter'&&!e.shiftKey){ e.preventDefault(); send(); } });
+box.addEventListener('input',()=>{ box.style.height='auto'; box.style.height=Math.min(box.scrollHeight,160)+'px'; });
+
+// --- attach a local file (client-side only: read in the browser, insert into the box; paste works natively) ---
+const langOf=n=>({py:'python',cpp:'cpp',c:'c',h:'cpp',hpp:'cpp',ps1:'powershell',sh:'bash',md:'markdown',html:'html',css:'css',js:'javascript',json:'json'}[n.split('.').pop().toLowerCase()]||'');
+function insertFile(file){
+  if(file.size>512*1024 && !confirm(`${file.name} is ${(file.size/1024).toFixed(0)} KB — large files take minutes to ingest (no batched prefill). Attach anyway?`)) return;
+  const r=new FileReader();
+  r.onload=()=>{ const block='Here is `'+file.name+'`:\n\n```'+langOf(file.name)+'\n'+r.result+'\n```\n\n';
+    box.value=block+box.value; box.dispatchEvent(new Event('input')); box.focus(); };
+  r.readAsText(file);
+}
+document.getElementById('attach').onclick=()=>document.getElementById('fileinput').click();
+document.getElementById('fileinput').onchange=e=>{ if(e.target.files[0]) insertFile(e.target.files[0]); e.target.value=''; };
+box.addEventListener('dragover',e=>{ e.preventDefault(); box.classList.add('drag'); });
+box.addEventListener('dragleave',()=>box.classList.remove('drag'));
+box.addEventListener('drop',e=>{ e.preventDefault(); box.classList.remove('drag'); if(e.dataTransfer.files[0]) insertFile(e.dataTransfer.files[0]); });
+box.focus();
+</script>
+</body>
+</html>

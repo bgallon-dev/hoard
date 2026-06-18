@@ -20,8 +20,8 @@ Reproduce: `powershell -File bench\run_bench2.ps1 -Tag q80 -Model models\qwen3ne
 | 35B vs 80B | **measured** (every graph) |
 | K = 16/24/32/48/64 | **measured** — K=64 fits both (~7.5 GB), so the full range is real |
 | RAM tier 1/2/4/(6) GB | **measured**; **8/12 GB infeasible** — this box has 15.8 GB physical RAM |
-| NVMe 2 vs 4–7 GB/s | **only ≤2 GB/s measured** — the drive maxes ~2.06 GB/s; faster is unmeasurable here (skipped, not modeled) |
-| 4K/16K context | **measured to 16K** (graph D) |
+| NVMe 2 vs 4–7 GB/s | **measured ≤2 GB/s** (throttled HDD→SATA→real NVMe, graph C). Above ~2 GB/s is physically unmeasurable on this drive. |
+| context / VRAM cliff | **measured to 16K decode** (D) + **the full (K, context) VRAM frontier mapped** (G); the 8 GB limit proved *soft* — it spills to shared RAM, not a hard cliff (H, I) |
 | Q4 vs Q3/mixed | **Q4 only** — no Q3 GGUFs on disk, no quantizer, ~44 GB download vs 49 GB free |
 | domain vs general | **measured** (graphs E, F) |
 
@@ -67,6 +67,15 @@ Both are bandwidth-bound. The 80B sits at a **higher NVMe-miss fraction (40.9% v
 routing spills more to disk — so it gains *more* from fast storage and suffers *more* on slow storage. Faster than
 ~2 GB/s is not measurable on this drive, so the 4–7 GB/s row is omitted rather than modeled.
 
+The SATA/HDD points here are **measured, not asserted**: each is a real engine run with `THROTTLE_MBPS` capping
+the decode-region read bandwidth (the loop sleeps out the rest of each read batch's budget). It's a controlled
+bandwidth cap, not literal SATA/HDD hardware. The swept curve is measured points (80B: 0.12→0.22→0.50→0.76→1.10
+tok/s climbing to **3.56 at the real ~2.1 GB/s drive**; 35B 0.22→…→5.66), with only the *unthrottled* top point
+being the exact native NVMe. **Honest limit found while doing this:** the throttle hits a **sleep-granularity floor
+at ~0.2 GB/s effective** — the engine's own disk-GB/s readout is ~0.19–0.20 for *both* the 50 and 100 MB/s
+settings — so 100 MB/s is the lowest *faithful* point; the 50 MB/s run confirms the floor (extra sleep, same
+effective bandwidth) rather than reaching a genuinely slower drive. Below ~0.2 GB/s this box can't simulate.
+
 ## E — Expert working set: domain vs general  (`cmp_E_workingset.png`)  → **locality is workload-specific**
 Distinct experts touched over a 200-token generation:
 | | general (CPU-arch prompt) | domain (code review) |
@@ -109,9 +118,59 @@ a KV cache** and pay O(context) attention; the 30/36 Gated-DeltaNet layers use a
 
 ---
 
+## G/H/I — The VRAM "cliff" that isn't (the result that survived contact with the hardware)
+The original storage and context claims were partly *asserted*; pushing them to measurement changed one of them.
+
+**G — the VRAM frontier (`cmp_G_vram_frontier.png`), measured.** Using a `DRYRUN`+`MAXKV` probe (allocate model +
+KV-sized-for-context-C + K-slot pool, report static VRAM, exit), the static allocation is exactly linear: KV
+**~0.049 MB/token** (80B) / **~0.041** (35B) — because only **12/48** and **10/40** layers carry a KV cache —
+and slots **~91 MB/K** (80B) / ~76 (35B). The context where `model + slots(K) + KV(ctx)` crosses 8 GB:
+| K | 35B max ctx | 80B max ctx |
+|---|---|---|
+| 16 | ~107K | ~101K |
+| 32 | ~77K | ~71K |
+| 48 | ~47K | ~41K |
+| 64 | ~18K | ~12K |
+
+So the "context cliff" lives **far past the 16K I originally stopped at** for any reasonable K — and the
+demonstration falls out directly: a pure-transformer MoE would carry KV in **all** 40/48 layers → 4× the KV
+slope → **¼ the context at the same K** (dashed lines). At K=32 the hybrid reaches ~71K context where a
+pure-transformer would spill at ~18K. *That* is the hybrid layout doing measurable work.
+
+**H — but 8 GB is a *soft* boundary (`cmp_H_no_cliff.png`), measured — this falsified my own hard-cliff
+assumption.** On Windows/WDDM the 8 GB card silently over-commits into **shared system RAM over PCIe**. Growing
+the slot pool *past* 8 GB does **not** crater tok/s — it keeps rising:
+| K | peak VRAM | 80B tok/s |
+|---|---|---|
+| 48 | 6.1 GB | 4.51 |
+| 64 | 7.5 GB | 4.75 |
+| 80 | 9.0 GB | 5.04 |
+| 96 | **10.5 GB** | **5.20** |
+
+The reason: a spilled slot is read over PCIe (~16 GB/s) — still far faster than the NVMe (~2 GB/s) it replaces.
+So overflowing VRAM is *graceful*: it's effectively a 4th cache tier (shared RAM) that beats disk. The frontier
+in G is therefore where *spill begins*, not where it dies.
+
+**I — context past the spill point (`cmp_I_ctx_spill.png`), measured.** A K=64 run (slots already fill VRAM, so KV
+spills at ~12K) generated to 24K context. Decode decays *smoothly* across the spill: **5.3 tok/s** peak (~4K) →
+**4.4** (10–12K, the 8 GB crossing) → **3.4** (24K) — a continuous ~36% decline with **no discontinuity at 12K**.
+Crossing the VRAM-spill point is a gradual PCIe bandwidth tax, exactly as H predicts — confirming the soft-frontier
+picture directly on the context axis. (So even at K=64 — the worst case for context — the 80B holds >3 tok/s at 24K.)
+
+The honest correction: there is **no hard VRAM cliff on this box** — there is a *soft frontier* (G) where the
+working set overflows dedicated VRAM into shared RAM, and crossing it taxes bandwidth gradually (H) rather than
+falling off a wall. The hybrid layout's payoff is that its ¼-size KV pushes that frontier ~4× further out in
+context.
+
 ## Headline
 The 3-tier streaming hierarchy **scales upward intact**: doubling total params (35B→80B) keeps the model usable
 (4.5 tok/s at K=64 on an 8 GB card), with the *same* knobs behaving the *same* way — more VRAM and more RAM both
 still help, monotonically. The cost of going bigger shows up exactly where the model predicts: a larger, more
 diffuse working set means a lower cache hit rate (more NVMe traffic), so the 80B is more storage-bound and gains
 less from the RAM tier. A3B keeps decode fast regardless of total size — which is why an 80B runs at all here.
+
+And the part that only showed up under measurement: there is **no hard VRAM cliff** on this box. The 8 GB limit
+is soft — WDDM over-commits into shared system RAM, which (over PCIe, ~16 GB/s) still beats the NVMe it stands in
+for, so overflowing VRAM via either K or context degrades *gracefully* rather than falling off a wall. The hybrid
+linear-attention layout earns its keep by keeping the KV cache ¼ the size of a pure transformer's, pushing that
+soft frontier ~4× further out in context — measured, not asserted.

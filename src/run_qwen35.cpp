@@ -268,7 +268,8 @@ int main(int argc,char**argv){
     int ram_cap = chatmode ? ((argc>4)?atoi(argv[4]):total_experts) : ((argc>6)?atoi(argv[6]):total_experts);   // RAM tier size
     if(ram_cap>total_experts) ram_cap=total_experts; if(ram_cap<n_used) ram_cap=n_used;
 
-    const int max_kv = chatmode ? 4096 : (tf ? (int)seq.size()+2 : T+ngen+2); // tf: full given sequence
+    int max_kv = chatmode ? 4096 : (tf ? (int)seq.size()+2 : T+ngen+2); // tf: full given sequence
+    if(const char* mk=getenv("MAXKV")){ int v=atoi(mk); if(v>max_kv) max_kv=v; } // bench: size KV for a target context (VRAM-cliff sweep) without generating it
     KV kv; kv.ctx=ggml_init({(size_t)2*n_layer*ggml_tensor_overhead()+1024,nullptr,true});
     for(int il=0;il<n_layer;++il){ bool need_kv = !is_qwen35 || !is_recr[il]; // qwen35: only full-attn layers use KV
         kv.k.push_back(need_kv?ggml_new_tensor_3d(kv.ctx,GGML_TYPE_F32,head_dim,n_head_kv,max_kv):nullptr);
@@ -336,6 +337,12 @@ int main(int argc,char**argv){
     if(csvpath){ csvf=fopen(csvpath,"w"); if(csvf) fprintf(csvf,"tok,t_ms,dt_ms,vram_hit,ram_hit,nvme_fall,reqs,distinct,disk_mb\n"); }
     long long tok_first_ns=0, tok_prev_ns=0;   // per-token wall-clock -> hit-rate-over-time + latency percentiles
     size_t vram = ggml_backend_buffer_get_size(M.wbuf)+ggml_backend_buffer_get_size(kv.buf)+ggml_backend_buffer_get_size(S.buf);
+    if(getenv("DRYRUN")){ // VRAM-cliff probe: report static allocation (if the KV alloc above OOM'd we already crashed = past the cliff)
+        size_t rs = rsbuf?ggml_backend_buffer_get_size(rsbuf):0; int nfull=0; for(int il=0;il<n_layer;++il) if(!is_qwen35||!is_recr[il]) nfull++;
+        printf("DRYRUN K=%d max_kv=%d static_vram_mb=%.1f model_mb=%.1f kv_mb=%.1f slots_mb=%.1f gdn_mb=%.1f kv_layers=%d/%d\n",
+            K,max_kv,(vram+rs)/1e6,ggml_backend_buffer_get_size(M.wbuf)/1e6,ggml_backend_buffer_get_size(kv.buf)/1e6,
+            ggml_backend_buffer_get_size(S.buf)/1e6,rs/1e6,nfull,n_layer);
+        return 0; }
 
     // fetch expert (il,e) bytes into the RAM tier; return RAM slot. RAM hit or NVMe fall-through.
     // copy expert (il,e) bytes (from RAM slot rs, at its head offset within the aligned buffer) into VRAM slot vs
@@ -653,6 +660,19 @@ int main(int argc,char**argv){
             double s=(t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)/1e9;
             fprintf(stderr,"[%zu tokens, %.2f tok/s]\n", gen.size(), s>0?gen.size()/s:0);
         };
+        if(getenv("SERVE")){
+            // headless server protocol (driven by server/serve.py): messages are <<<SEND>>>-delimited (content-safe,
+            // unlike blank-line), <<<RESET>>> starts a new conversation; each turn ends with a 0x04 byte on stdout
+            // (ASCII End-Of-Transmission, never produced by the tokenizer) so the reader knows the answer is complete.
+            fprintf(stderr,"[serve] ready: %s K=%d %d/%d experts resident\n",ARCH.c_str(),K,ram_cap,total_experts); fflush(stderr);
+            std::string msg,line;
+            while(std::getline(std::cin,line)){
+                if(line=="<<<RESET>>>"){ hist.clear(); msg.clear(); putchar(4); fflush(stdout); continue; }
+                if(line=="<<<SEND>>>"){ if(!msg.empty()){ respond(msg); msg.clear(); } putchar(4); fflush(stdout); continue; }
+                if(!msg.empty()) msg+="\n"; msg+=line;
+            }
+            llama_model_free(lm); return 0;
+        }
         fprintf(stderr,"\n=== %s streaming chat (K=%d, %d/%d experts resident, rest stream from NVMe) ===\n",ARCH.c_str(),K,ram_cap,total_experts);
         fprintf(stderr,"multi-line ok (paste code); blank line sends, /quit exits.\n");
         std::string msg,line;
