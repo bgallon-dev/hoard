@@ -24,6 +24,8 @@
 #include <set>
 #include <thread>
 #include <atomic>
+#include <mutex>
+#include <condition_variable>
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -84,34 +86,52 @@ struct HostExperts {
 // read the aligned superset [aoff,aoff+asize) DIRECTLY into dst (an aligned RT buffer) - no scratch, no memcpy.
 // real data lands at dst[head .. head+rsize).
 struct IOJob { uint8_t* dst; uint64_t aoff; uint32_t asize; uint32_t head; uint32_t rsize; };
+// Persistent worker pool. The previous version spawned `nw` std::threads on EVERY run_jobs call
+// (once per layer => 48x/token), each doing ~1 read then exiting. iobench shows the 970 EVO gives
+// 3.52 GB/s at QD8 on 512KB random reads, but per-call spawn/join collapsed the effective queue
+// depth to ~2-3 and capped realized bandwidth at ~2.08 GB/s. Spawning the workers ONCE and feeding
+// them per-batch keeps QD8 in flight => recovers the full ~3.5 GB/s. Lossless.
 struct DirectIO {
-    int n=0; std::vector<HANDLE> h; std::vector<FILE*> bf; uint64_t fsize=0;
+    int n=0; std::vector<HANDLE> h; std::vector<FILE*> bf; uint64_t fsize=0; std::string fpath;
+    std::vector<std::thread> pool;
+    std::mutex m; std::condition_variable cv_work, cv_done;
+    std::vector<IOJob>* cur=nullptr; int batch_total=0; uint64_t gen=0; bool stop=false;
+    std::atomic<int> next_idx{0}, done_cnt{0}, ready{0};
     void init(const char* p,int nn){
-        n=nn;
+        n=nn; fpath=p;
         HANDLE q=CreateFileA(p,GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,0,NULL);
         LARGE_INTEGER li; GetFileSizeEx(q,&li); fsize=(uint64_t)li.QuadPart; CloseHandle(q);
-        for(int i=0;i<n;++i){
-            h.push_back(CreateFileA(p,GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,FILE_FLAG_NO_BUFFERING|FILE_FLAG_RANDOM_ACCESS,NULL));
-            bf.push_back(fopen(p,"rb"));                                                          // buffered EOF fallback
-        }
+        h.assign(n,INVALID_HANDLE_VALUE);
+        for(int i=0;i<n;++i) bf.push_back(fopen(p,"rb"));                                          // buffered EOF fallback
+        for(int w=0;w<n;++w) pool.emplace_back([this,w]{ worker(w); });                           // spawn ONCE
+        while(ready.load()<n) std::this_thread::yield();                                           // wait for all worker handles open
     }
     void doread(int w,const IOJob& j){
         if(j.aoff+j.asize<=fsize){ LARGE_INTEGER li; li.QuadPart=(LONGLONG)j.aoff;
             SetFilePointerEx(h[w],li,NULL,FILE_BEGIN); DWORD got=0; ReadFile(h[w],j.dst,j.asize,&got,NULL); }   // direct into RT buffer
         else { _fseeki64(bf[w],(int64_t)(j.aoff+j.head),SEEK_SET); fread(j.dst+j.head,1,j.rsize,bf[w]); }         // last-sector: buffered
     }
+    void worker(int w){
+        h[w]=CreateFileA(fpath.c_str(),GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,FILE_FLAG_NO_BUFFERING|FILE_FLAG_RANDOM_ACCESS,NULL); // open in OWN thread
+        ready.fetch_add(1);
+        uint64_t seen=0;
+        for(;;){
+            { std::unique_lock<std::mutex> lk(m); cv_work.wait(lk,[&]{return stop||gen!=seen;}); if(stop) return; seen=gen; }
+            for(;;){ int j=next_idx.fetch_add(1); if(j>=batch_total) break; doread(w,(*cur)[j]); }
+            if(done_cnt.fetch_add(1)+1==n){ { std::lock_guard<std::mutex> lk(m); } cv_done.notify_one(); } // last finisher wakes run()
+        }
+    }
+    void run(std::vector<IOJob>& jobs){
+        if(jobs.empty()) return;
+        int total=(int)jobs.size();
+        if(n<=1){ for(int j=0;j<total;++j) doread(0,jobs[j]); return; }
+        { std::lock_guard<std::mutex> lk(m); cur=&jobs; batch_total=total; next_idx.store(0); done_cnt.store(0); ++gen; }
+        cv_work.notify_all();                                                                     // wake the warm pool
+        { std::unique_lock<std::mutex> lk(m); cv_done.wait(lk,[&]{return done_cnt.load()==n;}); }  // barrier: all workers drained
+    }
+    ~DirectIO(){ { std::lock_guard<std::mutex> lk(m); stop=true; ++gen; } cv_work.notify_all(); for(auto&t:pool) if(t.joinable()) t.join(); }
 };
-static void run_jobs(DirectIO& io, std::vector<IOJob>& jobs){
-    if(jobs.empty()) return;
-    int total=(int)jobs.size(); int nw = io.n<total ? io.n : total;
-    if(nw<=1){ for(int j=0;j<total;++j) io.doread(0,jobs[j]); return; }
-    std::atomic<int> idx{0};
-    std::vector<std::thread> ts; ts.reserve(nw);
-    for(int w=0;w<nw;++w) ts.emplace_back([&io,&jobs,&idx,total,w]{
-        for(;;){ int j=idx.fetch_add(1); if(j>=total) break; io.doread(w,jobs[j]); }
-    });
-    for(auto&t:ts) t.join();
-}
+static void run_jobs(DirectIO& io, std::vector<IOJob>& jobs){ io.run(jobs); }
 // ---- explicit RAM tier: bounded LRU cache of expert byte-buffers (warm experts) ----
 struct RamTier {
     int cap=0;                                         // max experts held in RAM
@@ -141,6 +161,7 @@ static void load_model(Model& M, HostExperts& H, const char* path, ggml_backend_
     n_ff       = (int)gku32(gguf,KEY("expert_feed_forward_length"),n_ff);  // MoE per-expert FFN if present
     n_expert   = (int)gku32(gguf,KEY("expert_count"),0);
     n_used     = (int)gku32(gguf,KEY("expert_used_count"),0);
+    if(const char* tk=getenv("TOPK")){ int t=atoi(tk); if(t>0 && t<n_used){ fprintf(stderr,"[topk] inference-time top-k reduction: %d -> %d active experts/layer (router renormalizes the survivors)\n",n_used,t); n_used=t; } } // footprint test: fewer active experts -> fewer streamed bytes/token
     n_ctx_orig = (int)gku32(gguf,KEY("context_length"),4096);
     freq_base  = gkf32(gguf,KEY("rope.freq_base"),10000.0f);
     eps        = gkf32(gguf,KEY("attention.layer_norm_rms_epsilon"),1e-5f);
@@ -195,7 +216,21 @@ static void load_model(Model& M, HostExperts& H, const char* path, ggml_backend_
     }
     M.wbuf=ggml_backend_alloc_ctx_tensors(nectx,backend);
 
-    H.f=fopen(path,"rb"); size_t doff=gguf_get_data_offset(gguf); std::vector<uint8_t> buf; int n_bf16=0;
+    // Load non-expert weights UNBUFFERED. Buffered reads here would fill the OS page cache, and cached
+    // file pages route every later NO_BUFFERING expert read through the cache manager -> NVMe throughput
+    // collapses 3.5 -> ~1.9 GB/s (bisected with pooltest2). Experts stay on disk and stream unbuffered.
+    HANDLE hload=CreateFileA(path,GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,FILE_FLAG_NO_BUFFERING|FILE_FLAG_SEQUENTIAL_SCAN,NULL);
+    const size_t SCRATCH=32u*1024*1024; uint8_t* scratch=(uint8_t*)VirtualAlloc(NULL,SCRATCH,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
+    auto uload=[&](uint64_t foff,size_t nb,uint8_t* dst){   // ALWAYS NO_BUFFERING (no buffered fallback -> page cache stays clean even for the EOF tensor)
+        size_t done=0;
+        while(done<nb){ uint64_t cur=foff+done; uint64_t a=cur&~(uint64_t)4095; uint32_t head=(uint32_t)(cur-a); size_t want=nb-done;
+            size_t asize=(head+want+4095)&~(size_t)4095; if(asize>SCRATCH) asize=SCRATCH;   // reads past EOF return a short got (valid)
+            LARGE_INTEGER li; li.QuadPart=(LONGLONG)a; SetFilePointerEx(hload,li,NULL,FILE_BEGIN);
+            DWORD got=0; if(!ReadFile(hload,scratch,(DWORD)asize,&got,NULL) || got<=head) break;
+            size_t avail=(size_t)got-head; size_t take=avail<want?avail:want;
+            memcpy(dst+done,scratch+head,take); done+=take; if((DWORD)asize!=got) break; }   // got<asize => hit EOF, all available consumed
+    };
+    H.f=nullptr; size_t doff=gguf_get_data_offset(gguf); std::vector<uint8_t> buf; int n_bf16=0;
     for(ggml_tensor* t=ggml_get_first_tensor(all); t; t=ggml_get_next_tensor(all,t)){
         int64_t ti=gguf_find_tensor(gguf,t->name); size_t off=gguf_get_tensor_offset(gguf,ti), nb=ggml_nbytes(t);
         if(is_exp(t->name)){
@@ -206,8 +241,7 @@ static void load_model(Model& M, HostExperts& H, const char* path, ggml_backend_
             else if(!strcmp(which,"up")){ H.uoff[il]=fileoff; H.ustride[il]=nb/n_expert; H.utype[il]=t->type; }
             else if(!strcmp(which,"down")){ H.doff[il]=fileoff; H.dstride[il]=nb/n_expert; H.dtype[il]=t->type; }
         } else {
-            buf.resize(nb); _fseeki64(H.f,(int64_t)(doff+off),SEEK_SET);
-            if(fread(buf.data(),1,nb,H.f)!=nb){fprintf(stderr,"read fail %s\n",t->name);exit(1);}
+            buf.resize(nb); uload(doff+off,nb,buf.data());
             if(t->type==GGML_TYPE_BF16){ // upconvert bf16->f32 (high 16 bits of the f32); Vulkan lacks a bf16 path
                 int64_t ne=ggml_nelements(t); std::vector<float> f32((size_t)ne); const uint16_t* s=(const uint16_t*)buf.data();
                 for(int64_t i=0;i<ne;++i){ uint32_t bits=((uint32_t)s[i])<<16; memcpy(&f32[i],&bits,4); }
@@ -216,7 +250,8 @@ static void load_model(Model& M, HostExperts& H, const char* path, ggml_backend_
             M.ten[t->name]=nesrc[t->name];
         }
     }
-    M.ctx=nectx; M.gguf=gguf;   // keep H.f OPEN for on-demand disk reads
+    CloseHandle(hload); VirtualFree(scratch,0,MEM_RELEASE);   // release the unbuffered loader (experts stream via DirectIO)
+    M.ctx=nectx; M.gguf=gguf;
     if(n_bf16) fprintf(stderr,"[bf16->f32] upconverted %d bf16 tensors (Vulkan has no bf16 path)\n",n_bf16);
     fprintf(stderr,"loaded: %zu non-expert VRAM tensors; experts ON DISK (per-expert ~%.1f MB)\n",
         M.ten.size(),(H.gstride[0]+H.ustride[0]+H.dstride[0])/1e6);
@@ -263,6 +298,26 @@ int main(int argc,char**argv){
     size_t gbsz,ubsz,dbsz; { size_t mg=0,mu=0,md=0; for(int il=0;il<n_layer;++il){ if(H.gstride[il]>mg)mg=H.gstride[il]; if(H.ustride[il]>mu)mu=H.ustride[il]; if(H.dstride[il]>md)md=H.dstride[il]; }
         auto rup=[](size_t v){ return (v+8192+4095)&~(size_t)4095; }; gbsz=rup(mg); ubsz=rup(mu); dbsz=rup(md);
         fprintf(stderr,"[directIO] 8 workers, reads land DIRECTLY in aligned RT buffers (no scratch/memcpy); buf g/u/d=%zu/%zu/%zu KB\n",gbsz/1024,ubsz/1024,dbsz/1024); }
+    if(const char* st=getenv("IOSELFTEST")){   // diagnostic: realized pool bandwidth (random 512KB reads) vs batch size; should hit the drive's ~3.5 GB/s with a clean page cache
+        int M=atoi(st); if(M<=0)M=4096; const uint32_t BS=524288;
+        std::vector<uint8_t*> bufs(M); std::vector<IOJob> all(M); uint64_t maxoff=io.fsize-BS-4096;
+        for(int i=0;i<M;++i) bufs[i]=(uint8_t*)VirtualAlloc(NULL,BS,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
+        // bufmode: 0=distinct cold buffers, 1=distinct pre-faulted (memset), 2=only 8 buffers reused (iobench-like)
+        auto bw=[&](int chunk,unsigned seed,int bufmode)->double{
+            for(int i=0;i<M;++i){ seed=seed*1103515245u+12345u; uint64_t off=(((uint64_t)seed*4096ull)%maxoff)&~(uint64_t)4095;
+                uint8_t* d = (bufmode==2)? bufs[i&7] : bufs[i]; all[i]=IOJob{d,off,BS,0,BS}; }
+            if(bufmode==1) for(int i=0;i<M;++i) memset(bufs[i],0,BS);   // pre-fault every page resident
+            struct timespec a,c; clock_gettime(CLOCK_MONOTONIC,&a);
+            if(chunk>=M) run_jobs(io,all);
+            else for(int o=0;o<M;o+=chunk){ int n=(o+chunk<=M)?chunk:(M-o); std::vector<IOJob> b(all.begin()+o,all.begin()+o+n); run_jobs(io,b); }
+            clock_gettime(CLOCK_MONOTONIC,&c); double sec=(c.tv_sec-a.tv_sec)+(c.tv_nsec-a.tv_nsec)/1e9; return (double)M*BS/1e9/sec; };
+        fprintf(stderr,"[ioselftest] %d x 512KB random reads through the persistent pool (QD=%d):\n",M,ioqd);
+        fprintf(stderr,"   big batch, distinct COLD buffers     : %.2f GB/s\n", bw(M,11u,0));
+        fprintf(stderr,"   big batch, distinct PRE-FAULTED bufs : %.2f GB/s\n", bw(M,13u,1));
+        fprintf(stderr,"   big batch, only 8 buffers reused     : %.2f GB/s\n", bw(M,17u,2));
+        fprintf(stderr,"   batches of 9, PRE-FAULTED buffers    : %.2f GB/s\n", bw(9,37u,1));
+        return 0;
+    }
     int K = Karg?Karg:(mode=="naive"?n_used:16);   // naive needs >= n_used slots
     int total_experts = n_layer*n_expert;
     int ram_cap = chatmode ? ((argc>4)?atoi(argv[4]):total_experts) : ((argc>6)?atoi(argv[6]):total_experts);   // RAM tier size
@@ -336,6 +391,11 @@ int main(int argc,char**argv){
     const char* csvpath = getenv("CSV"); FILE* csvf=nullptr;                                  // per-token metrics CSV
     if(csvpath){ csvf=fopen(csvpath,"w"); if(csvf) fprintf(csvf,"tok,t_ms,dt_ms,vram_hit,ram_hit,nvme_fall,reqs,distinct,disk_mb\n"); }
     long long tok_first_ns=0, tok_prev_ns=0;   // per-token wall-clock -> hit-rate-over-time + latency percentiles
+    // --- DB-reframe Stage-0/1 instrumentation (env-gated) ---
+    FILE* gdf=nullptr; if(const char* gp=getenv("GATEDUMP")) gdf=fopen(gp,"w"); bool gatedump=(gdf!=nullptr); // per-(decode tok,layer): gate band + residency tier, for the OFFLINE residency-substitution ceiling
+    if(gdf) fprintf(gdf,"# tok layer wk | id:prob:selected:restier(0=cold,1=vram,2=ram) ... (experts with prob>=wk-0.2)\n");
+    FILE* pf=nullptr; if(const char* pp=getenv("PROFILE")) pf=fopen(pp,"w"); // lean access trace: per decode (tok,layer) the selected expert ids; '# turn' marks a new prompt/turn
+    double nll_sum=0; long nll_n=0; std::vector<float> pr;   // teacher-forced NLL -> perplexity (quality probe); pr = host copy of full router softmax
     size_t vram = ggml_backend_buffer_get_size(M.wbuf)+ggml_backend_buffer_get_size(kv.buf)+ggml_backend_buffer_get_size(S.buf);
     if(getenv("DRYRUN")){ // VRAM-cliff probe: report static allocation (if the KV alloc above OOM'd we already crashed = past the cliff)
         size_t rs = rsbuf?ggml_backend_buffer_get_size(rsbuf):0; int nfull=0; for(int il=0;il<n_layer;++il) if(!is_qwen35||!is_recr[il]) nfull++;
@@ -484,6 +544,7 @@ int main(int argc,char**argv){
                 ggml_tensor* selT=ggml_top_k(g,probs,n_used);
                 ggml_tensor* wT=ggml_get_rows(g,ggml_reshape_3d(g,probs,1,n_expert,1),selT);
                 ggml_set_output(fx); ggml_set_output(ffn_inp); ggml_set_output(selT); ggml_set_output(wT);
+                if(gatedump){ ggml_set_output(probs); ggml_build_forward_expand(gf,probs); }
                 ggml_build_forward_expand(gf,fx); ggml_build_forward_expand(gf,ffn_inp);
                 ggml_build_forward_expand(gf,selT); ggml_build_forward_expand(gf,wT);
                 if(extra1) ggml_build_forward_expand(gf,extra1);
@@ -497,7 +558,9 @@ int main(int argc,char**argv){
                 ggml_backend_tensor_get(selT,sel.data(),0,(size_t)n_used*4);
                 if(p>=T-1) for(int j=0;j<n_used;++j) touched.insert(il*n_expert+sel[j]); // working set over DECODE
                 if(trace && p>=T-1){ if(il==0) seltrace.emplace_back(); seltrace.back().emplace_back(sel.begin(),sel.begin()+n_used); }
+                if(pf && p>=T-1){ fprintf(pf,"%d %d",(int)gen.size(),il); for(int j=0;j<n_used;++j) fprintf(pf," %d",sel[j]); fprintf(pf,"\n"); } // lean access trace
                 ggml_backend_tensor_get(wT,wsel.data(),0,(size_t)n_used*4);
+                if(gatedump && p>=T-1){ pr.resize(n_expert); ggml_backend_tensor_get(probs,pr.data(),0,(size_t)n_expert*4); } // full router softmax -> host (read before ggml_free)
                 if(wnorm){ float ws=0; for(int j=0;j<n_used;++j) ws+=wsel[j];
                     if(ws<6.103515625e-5f) ws=6.103515625e-5f;              // clamp (matches llama.cpp F16 min)
                     for(int j=0;j<n_used;++j) wsel[j]/=ws; }                // renormalize top-k weights to sum 1
@@ -505,6 +568,16 @@ int main(int argc,char**argv){
                 ggml_free(g);
             }
             if(p>=T) tA+=NOW()-_ta;
+            if(gatedump && p>=T-1 && (int)pr.size()==n_expert){ // residency-substitution ceiling data: gate band + decision-time residency tier (snapshot BEFORE this token's fetch/eviction)
+                float wk=1e30f; for(int j=0;j<n_used;++j){ float w=pr[sel[j]]; if(w<wk) wk=w; }
+                float band=wk-0.2f;
+                fprintf(gdf,"%d %d %.6g",(int)gen.size(),il,wk);
+                for(int e=0;e<n_expert;++e){ if(pr[e]<band) continue;
+                    int issel=0; for(int j=0;j<n_used;++j) if(sel[j]==e){issel=1;break;}
+                    int res = S.expert_slot[il].count(e)?1 : (RT.key2slot.count(il*n_expert+e)?2:0);
+                    fprintf(gdf," %d:%.6g:%d:%d",e,pr[e],issel,res); }
+                fprintf(gdf,"\n");
+            }
             long long _tf=NOW();
             // ---- stream selected experts: parallel device-direct reads, then stage RAM->VRAM ----
             std::vector<int> slotidx(n_used);
@@ -613,6 +686,10 @@ int main(int argc,char**argv){
             }
             int bi=0; float bv=logits[0]; for(int v=1;v<n_vocab;++v) if(logits[v]>bv){bv=logits[v];bi=v;}
             gen.push_back(bi); on_token(bi);
+            if(tf && p+1<(int)seq.size()){ int nt=seq[p+1];   // teacher-forced NLL of the true next token -> perplexity (quality probe)
+                double mx=logits[0]; for(int v=1;v<n_vocab;++v) if((double)logits[v]>mx) mx=logits[v];
+                double se=0; for(int v=0;v<n_vocab;++v) se+=exp((double)logits[v]-mx);
+                nll_sum += (mx+log(se))-(double)logits[nt]; nll_n++; }
             if(csvf){ long long now=NOW(); if(!tok_first_ns) tok_first_ns=now;
                 double t_ms=(now-tok_first_ns)/1e6, dt_ms=tok_prev_ns?(now-tok_prev_ns)/1e6:0; tok_prev_ns=now;
                 fprintf(csvf,"%zu,%.3f,%.3f,%ld,%ld,%ld,%ld,%zu,%.3f\n",
@@ -650,7 +727,8 @@ int main(int argc,char**argv){
             int Tp=(int)sq.size();
             int think_open=(is_qwen35&&!is_qwen3next)?248068:151667, think_close=(is_qwen35&&!is_qwen3next)?248069:151668; // <think>/</think> ids (qwen35moe vocab vs standard Qwen)
             gen.clear(); bool inthink=false; printf("\n");
-            generate(sq,Tp,1024,[&](int id){
+            int maxgen=getenv("MAXGEN")?atoi(getenv("MAXGEN")):1024;   // cap chat generation (corpus collection wants bounded traces)
+            generate(sq,Tp,maxgen,[&](int id){
                 if(id==think_open){inthink=true;return;} if(id==think_close){inthink=false;return;}  // hide <think>...</think>
                 if(inthink||id==eos_id) return;
                 char b[256]; int k=llama_token_to_piece(vocab,id,b,256,0,false); if(k>0){ fwrite(b,1,k,stdout); fflush(stdout); } });
@@ -668,10 +746,10 @@ int main(int argc,char**argv){
             std::string msg,line;
             while(std::getline(std::cin,line)){
                 if(line=="<<<RESET>>>"){ hist.clear(); msg.clear(); putchar(4); fflush(stdout); continue; }
-                if(line=="<<<SEND>>>"){ if(!msg.empty()){ respond(msg); msg.clear(); } putchar(4); fflush(stdout); continue; }
+                if(line=="<<<SEND>>>"){ if(!msg.empty()){ if(pf){ fprintf(pf,"# turn\n"); fflush(pf);} respond(msg); msg.clear(); } putchar(4); fflush(stdout); continue; }
                 if(!msg.empty()) msg+="\n"; msg+=line;
             }
-            llama_model_free(lm); return 0;
+            if(pf) fclose(pf); llama_model_free(lm); return 0;
         }
         fprintf(stderr,"\n=== %s streaming chat (K=%d, %d/%d experts resident, rest stream from NVMe) ===\n",ARCH.c_str(),K,ram_cap,total_experts);
         fprintf(stderr,"multi-line ok (paste code); blank line sends, /quit exits.\n");
@@ -689,6 +767,9 @@ int main(int argc,char**argv){
     // ---- one-shot generation (benchmark / validation) ----
     generate(seq,T,ngen,[](int){});
     if(csvf) fclose(csvf);
+    if(gdf) fclose(gdf);
+    if(pf) fclose(pf);
+    if(nll_n>0) printf("QUALITY: teacher-forced over %ld positions: mean NLL=%.5f  perplexity=%.4f\n", nll_n, nll_sum/nll_n, exp(nll_sum/nll_n));
     double secs=(t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)/1e9;
     vram += peak_compute;
 

@@ -1,6 +1,6 @@
 # hoard
 
-**A from-scratch streaming Mixture-of-Experts inference engine that runs a 30B-parameter model on an 8 GB GPU — by keeping the experts on NVMe and streaming only the few that each token needs.**
+**A from-scratch streaming Mixture-of-Experts inference engine that runs 30B–80B models on an 8 GB GPU — by keeping the experts on NVMe and streaming only the few that each token needs.**
 
 Hand-written forward pass, router, KV cache, and a three-tier residency cache (VRAM → RAM → NVMe), built on an AMD RX 6600 (Vulkan, no ROCm). Validated token-for-token against llama.cpp.
 
@@ -15,6 +15,8 @@ Hand-written forward pass, router, KV cache, and a three-tier residency cache (V
 | Correctness | OLMoE: **8/8 token-for-token** vs llama.cpp · Qwen3: logits match the reference within fp |
 
 The result is a usable artifact: a private, local, 30B-class **code reviewer** on a ~$200 GPU.
+
+The same engine now streams the larger **hybrid-attention** models too — Qwen3.5-35B-A3B and **Qwen3-Next-80B-A3B** (~45 GB on disk → 6.1 GB VRAM, ~5.8 tok/s), token-validated against llama.cpp. Their 36 linear (gated-delta-net) + 12 full-attention layer mix keeps the KV cache at ¼ rate, so context is rarely the binding constraint. See [`notes/RESULTS-cmp.md`](notes/RESULTS-cmp.md) and the per-layer [`notes/MEMORY-FLOW.md`](notes/MEMORY-FLOW.md).
 
 ## How it works
 
@@ -32,8 +34,9 @@ This was as much a measurement project as an engineering one. Highlights (full t
 
 - **One ratio predicts feasibility.** Per-token expert footprint `F = n_used × n_layers × bytes_per_expert` vs the VRAM expert budget `B`. `F/B ≪ 1` → caching works (Qwen3-30B: 0.17, ~86 % VRAM hit). `F/B > 1` → a single token's experts don't even fit, so cross-token caching is *structurally* impossible (Qwen3-235B: 2.8).
 - **MoE routing is diffuse, not concentrated.** Over 256 generated tokens a focused code-review prompt touches **77 % of all experts (13.5 GB)** — *more* than open-ended text. That exceeds 16 GB of RAM, putting the model on the "cliff" where NVMe latency decides usable-slow vs unusable-crawl. It lands on usable-slow (~6 tok/s) only because the NVMe sustains ~2 GB/s.
-- **The streaming I/O has a structural ceiling.** The per-layer barrier (a layer needs all its experts before it can compute) makes reads bursty, capping realized bandwidth at ~2.3 GB/s — short of the drive's ~3.5 GB/s sustained ceiling — without speculative prefetch.
-- **The curriculum of bugs.** Per-layer mixed quantization, `_fseeki64` for >2 GB offsets, and an architecture-specific router bug (`norm_topk_prob`: Qwen3 renormalizes the top-8 weights, OLMoE doesn't, and llama.cpp hardcodes this per-arch rather than storing it in the GGUF). See `notes/STATUS.md`.
+- **The streaming I/O "ceiling" was mostly a bug, not physics.** Realized bandwidth long sat at ~2.0 GB/s, blamed on the per-layer barrier. Bisection with a standalone pool harness ([`src/pooltest*.cpp`](src/pooltest2.cpp)) found the real causes on the 80B engine: per-call I/O-thread spawning collapsed effective queue depth, and — the big one — loading weights through *buffered* reads pollutes the OS page cache, which silently routes later `FILE_FLAG_NO_BUFFERING` reads through the cache manager and **halves** their throughput (3.5 → 1.9 GB/s). A persistent worker pool + an unbuffered weight loader lifted real-decode bandwidth to **3.11 GB/s** and throughput **+35 %** (4.28 → 5.78 tok/s on the 80B), losslessly. The per-layer barrier is real but small — it caps decode at ~3.0 GB/s vs the drive's 3.5 GB/s isolated max, *not* 2.3.
+- **The memory flow, mapped end-to-end** ([`notes/MEMORY-FLOW.md`](notes/MEMORY-FLOW.md)). Decode moves **262 MB/token** of expert weights NVMe→RAM→VRAM — and *more* (283 MB) over PCIe, since RAM-tier hits also stage to VRAM — all gated by an 8 KB residual thread between layers (a 33,000× mismatch). A cache simulator validated at 98.8 % against the engine, plus a 10-domain expert-activation corpus, settled the optimization space: prefetch and clustering are **dead** (the cold tail is diffuse and unpredictable), domain-aware tiering is the lone lossless survivor (~+3 %), and a bigger RAM tier — which the simulator predicted as a win — is **hardware-falsified** (memory pressure collapses NVMe bandwidth and then OOMs; the 16 GB box is already at its `ram_cap` ceiling).
+- **The curriculum of bugs.** Per-layer mixed quantization, `_fseeki64` for >2 GB offsets, an architecture-specific router bug (`norm_topk_prob`: Qwen3 renormalizes the top weights, OLMoE doesn't, and llama.cpp hardcodes this per-arch rather than storing it in the GGUF), and the gated-delta-net q/k repeat-interleave that must key on the architecture, not the head counts. See `notes/STATUS.md` and `notes/RESULTS-cmp.md`.
 
 ## Requirements
 
@@ -86,20 +89,21 @@ cd build
 
 | path | what |
 |---|---|
-| `src/run_moe_stream.cpp` | **the engine** — streaming forward, 3-tier cache, device-direct NVMe I/O, chat REPL |
+| `src/run_moe_stream.cpp` | **the original engine** (30B) — streaming forward, 3-tier cache, device-direct NVMe I/O, chat REPL |
+| `src/run_qwen35.cpp` | **the hybrid engine** (Qwen3.5-35B, Qwen3-Next-80B) — adds gated-delta-net linear attention, a persistent I/O worker pool, an unbuffered weight loader, and `GATEDUMP`/`PROFILE` activation-trace instrumentation |
 | `src/run_m1.cpp` | reference recompute used for token-for-token validation |
 | `src/ref_gen.cpp` · `src/tok.cpp` · `src/gguf_dump.c` | reference generator, vocab-only tokenizer, GGUF metadata dumper |
-| `src/iobench.cpp` · `src/evict.c` | NVMe queue-depth benchmark, OS page-cache eviction |
+| `src/iobench.cpp` · `src/pooltest*.cpp` · `src/evict.c` | NVMe queue-depth/block-size benchmark, standalone I/O-pool harnesses (isolated the page-cache throughput bug), OS page-cache eviction |
 | `src/run_spec*.cpp` | residency-aware speculative decoding (measured *slower* — see STATUS) |
 | `tools/fbin.c` | f32 tensor comparator |
-| `notes/STATUS.md` | the full measured trail (every number, every bug) |
+| `notes/STATUS.md` · `notes/RESULTS-cmp.md` · `notes/MEMORY-FLOW.md` | the measured trail; 35B-vs-80B streaming sweep + VRAM frontier; per-layer memory-flow analysis |
 | `scripts/build.ps1` | build driver |
 
 ## Status & limitations
 
 - **Platform-specific**: Windows + AMD/Vulkan + NVMe; the I/O path uses Win32 (`CreateFile`/`ReadFile`).
-- **Architectures**: validated on OLMoE (MHA) and Qwen3-MoE (GQA + per-head QK-norm + `norm_topk_prob`). MLA (DeepSeek-V2/V3) is not implemented.
-- **Speed**: ~6 tok/s — this buys *reach* (running models far larger than VRAM), not throughput.
+- **Architectures**: validated on OLMoE (MHA), Qwen3-MoE (GQA + per-head QK-norm + `norm_topk_prob`), and the hybrid gated-delta-net families Qwen3.5-35B-A3B and Qwen3-Next-80B-A3B (36 linear + 12 full-attention layers). MLA (DeepSeek-V2/V3) is not implemented.
+- **Speed**: ~5.8–6 tok/s — this buys *reach* (running models far larger than VRAM), not throughput; the Amdahl ceiling (~30 % fixed overhead) caps any lossless I/O win at ~2.2×, and the diffuse, non-saturating expert working set is the wall.
 
 ## References
 
