@@ -23,12 +23,22 @@ docs/
 *.err
 cl.out
 d.out
-bench/
+# bench: ignore heavy raw data (gatedump traces, etc.) but TRACK the reproducible analysis
+bench/**
+!bench/**/
+!bench/**/*.py
+!bench/**/*.ps1
+!bench/**/*.sh
+!bench/results/**/*.csv
+!bench/figs/**/*.png
 # binary reference-activation dumps (validation scratch)
 notes/ref_acts/
+# saved chat conversations (per-user data, created by server/serve.py)
+server/_chatdata/
 
 # ---- OS / editor ----
 .DS_Store
 Thumbs.db
 *.swp
 .vscode/
+__pycache__/

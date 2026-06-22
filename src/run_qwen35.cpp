@@ -26,6 +26,8 @@
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
+#include <deque>
+#include <random>
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -53,6 +55,9 @@ static int  ssm_d_conv=4,ssm_d_inner=0,ssm_d_state=0,ssm_dt_rank=0,ssm_n_group=0
 static int  n_ff_shexp=0;                  // shared-expert FFN length (0=none)
 static int  full_attn_interval=4;          // every Nth layer (1-indexed) is full attention
 static std::vector<char> is_recr;          // per layer: 1=linear(GDN recurrent), 0=full attention
+static std::atomic<bool> g_stop{false};    // SERVE: interrupt the current generation (Stop button)
+static float g_temp=0.0f;                  // SERVE: sampling temperature (0 = greedy argmax)
+static std::mt19937 g_rng((unsigned)time(nullptr));  // sampler RNG (advances across turns -> regenerate varies)
 static int  rope_sections[4]={0,0,0,0};
 static std::string ARCH;
 static uint32_t gku32(gguf_context*g,const std::string&k,uint32_t d){int64_t i=gguf_find_key(g,k.c_str());return i<0?d:gguf_get_val_u32(g,i);}
@@ -270,6 +275,15 @@ struct Slots {
     std::vector<std::map<int,int>> expert_slot;     // [layer] expert -> slot
     std::vector<std::list<int>> lru;                // [layer] slots, front=most recent
 };
+
+// decode a base64 line (conversation content is sent base64 so multi-line/code text survives the line protocol)
+static std::string b64dec(const std::string& in){
+    static const std::string T="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out; int val=0, bits=-8;
+    for(unsigned char c:in){ if(c=='=') break; size_t p=T.find((char)c); if(p==std::string::npos) continue;
+        val=(val<<6)|(int)p; bits+=6; if(bits>=0){ out.push_back(char((val>>bits)&0xFF)); bits-=8; } }
+    return out;
+}
 
 int main(int argc,char**argv){
     if(argc<3){fprintf(stderr,"usage: %s model ids_csv ngen mode[naive|cache] [K] [ram_experts]\n       %s model chat [K] [ram_experts]   (interactive text REPL)\n",argv[0],argv[0]);return 2;}
@@ -684,7 +698,13 @@ int main(int argc,char**argv){
                 fprintf(stderr,"  pos%d top5:",p-(T-1)); for(int k=0;k<5;++k)fprintf(stderr," %d=%.3f",t5[k],logits[t5[k]]);
                 fprintf(stderr,"  (gap %.3f)\n",logits[t5[0]]-logits[t5[1]]);
             }
-            int bi=0; float bv=logits[0]; for(int v=1;v<n_vocab;++v) if(logits[v]>bv){bv=logits[v];bi=v;}
+            int bi=0; { float bv=logits[0]; for(int v=1;v<n_vocab;++v) if(logits[v]>bv){bv=logits[v];bi=v;} } // argmax (also the temp fallback)
+            if(g_temp>0.0f && !tf){   // temperature sampling over the head of the distribution (logit floor avoids tail garbage)
+                double mx=(double)logits[bi], cut=mx-12.0, sum=0;
+                for(int v=0;v<n_vocab;++v) if((double)logits[v]>=cut) sum+=exp(((double)logits[v]-mx)/g_temp);
+                double r=std::uniform_real_distribution<double>(0.0,sum)(g_rng), acc=0;
+                for(int v=0;v<n_vocab;++v) if((double)logits[v]>=cut){ acc+=exp(((double)logits[v]-mx)/g_temp); if(acc>=r){ bi=v; break; } }
+            }
             gen.push_back(bi); on_token(bi);
             if(tf && p+1<(int)seq.size()){ int nt=seq[p+1];   // teacher-forced NLL of the true next token -> perplexity (quality probe)
                 double mx=logits[0]; for(int v=1;v<n_vocab;++v) if((double)logits[v]>mx) mx=logits[v];
@@ -699,7 +719,7 @@ int main(int argc,char**argv){
                     gen.size(),touched.size(),100.0*touched.size()/(double)(n_layer*n_expert),
                     [&]{double mb=0;for(int key:touched)mb+=H.gstride[key/n_expert]+H.ustride[key/n_expert]+H.dstride[key/n_expert];return mb/1e6;}());
             if(tf){ if(p+1>=(int)seq.size()) break; }              // teacher-force: follow given seq
-            else { static const bool noeos=getenv("NOEOS")!=nullptr; if((int)gen.size()>=ngen||(bi==eos_id&&!noeos)) break; seq.push_back(bi); } // NOEOS: keep generating to ngen (context-scaling bench)
+            else { static const bool noeos=getenv("NOEOS")!=nullptr; if(g_stop||(int)gen.size()>=ngen||(bi==eos_id&&!noeos)) break; seq.push_back(bi); } // NOEOS: keep generating to ngen ; g_stop: Stop button
         }
     }
     clock_gettime(CLOCK_MONOTONIC,&t1);
@@ -738,17 +758,49 @@ int main(int argc,char**argv){
             double s=(t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)/1e9;
             fprintf(stderr,"[%zu tokens, %.2f tok/s]\n", gen.size(), s>0?gen.size()/s:0);
         };
+        // restore a saved conversation's context: rebuild the chat template from stored turns and set hist.
+        // The next respond() re-prefills it (engine has no batched prefill, so cost ~ conversation length).
+        auto load_history=[&](const std::vector<std::pair<char,std::string>>& msgs){
+            std::string s;
+            for(auto& m:msgs){
+                if(m.first=='U') s += "<|im_start|>user\n"+m.second+"<|im_end|>\n";
+                else s += "<|im_start|>assistant\n"+((is_qwen35&&!is_qwen3next)?std::string("<think>\n\n</think>\n\n"):std::string())+m.second+"<|im_end|>\n";
+            }
+            int32_t need=llama_tokenize(vocab,s.c_str(),(int)s.size(),nullptr,0,false,true);
+            std::vector<llama_token> tt(need<0?-need:need);
+            if(!tt.empty()) llama_tokenize(vocab,s.c_str(),(int)s.size(),tt.data(),(int)tt.size(),false,true);
+            hist.assign(tt.begin(),tt.end());
+            fprintf(stderr,"[load] %zu turns -> %zu ctx tokens\n",msgs.size(),hist.size());
+        };
         if(getenv("SERVE")){
             // headless server protocol (driven by server/serve.py): messages are <<<SEND>>>-delimited (content-safe,
             // unlike blank-line), <<<RESET>>> starts a new conversation; each turn ends with a 0x04 byte on stdout
             // (ASCII End-Of-Transmission, never produced by the tokenizer) so the reader knows the answer is complete.
             fprintf(stderr,"[serve] ready: %s K=%d %d/%d experts resident\n",ARCH.c_str(),K,ram_cap,total_experts); fflush(stderr);
+            // dedicated stdin reader so <<<STOP>>> can be seen DURING generation; everything else is queued.
+            std::deque<std::string> q; std::mutex qm; std::condition_variable qcv; bool eof=false;
+            std::thread reader([&]{
+                std::string l;
+                while(std::getline(std::cin,l)){
+                    if(l=="<<<STOP>>>"){ g_stop=true; continue; }                                          // out-of-band: interrupt generation
+                    { std::lock_guard<std::mutex> lk(qm); q.push_back(l); } qcv.notify_one();
+                }
+                { std::lock_guard<std::mutex> lk(qm); eof=true; } qcv.notify_one();
+            });
             std::string msg,line;
-            while(std::getline(std::cin,line)){
+            std::vector<std::pair<char,std::string>> loadmsgs; bool loading=false;
+            for(;;){
+                { std::unique_lock<std::mutex> lk(qm); qcv.wait(lk,[&]{return !q.empty()||eof;}); if(q.empty()){ break; } line=q.front(); q.pop_front(); }
+                if(line=="<<<LOAD>>>"){ loadmsgs.clear(); loading=true; continue; }                        // begin context restore
+                if(line=="<<<ENDLOAD>>>"){ loading=false; load_history(loadmsgs); putchar(4); fflush(stdout); continue; }
+                if(loading){ if(line.size()>=2 && (line[0]=='U'||line[0]=='A') && line[1]==' ') loadmsgs.push_back({line[0],b64dec(line.substr(2))}); continue; } // "U <b64>" / "A <b64>"
                 if(line=="<<<RESET>>>"){ hist.clear(); msg.clear(); putchar(4); fflush(stdout); continue; }
-                if(line=="<<<SEND>>>"){ if(!msg.empty()){ if(pf){ fprintf(pf,"# turn\n"); fflush(pf);} respond(msg); msg.clear(); } putchar(4); fflush(stdout); continue; }
+                if(line.rfind("<<<TEMP ",0)==0){ g_temp=(float)atof(line.c_str()+8); fprintf(stderr,"[temp] %.2f\n",g_temp); continue; } // "<<<TEMP 0.7>>>"
+                if(line=="<<<SEND>>>"){ if(!msg.empty()){ if(pf){ fprintf(pf,"# turn\n"); fflush(pf);} g_stop=false; respond(msg); msg.clear(); } putchar(4); fflush(stdout); continue; }
+                if(line=="/quit") break;
                 if(!msg.empty()) msg+="\n"; msg+=line;
             }
+            g_stop=true; reader.detach();   // process is terminating; don't block on the reader's getline
             if(pf) fclose(pf); llama_model_free(lm); return 0;
         }
         fprintf(stderr,"\n=== %s streaming chat (K=%d, %d/%d experts resident, rest stream from NVMe) ===\n",ARCH.c_str(),K,ram_cap,total_experts);
@@ -794,6 +846,11 @@ int main(int argc,char**argv){
     { double st=(tFetch-tDisk)/1e9;
       printf("DECODE BREAKDOWN (%.2fs decode): graphA(attn+router) %.0f%% | fetch %.0f%% [disk %.0f%% + H2D-stage %.0f%%] | graphB(expertFFN)+sum %.0f%% | embed %.0f%% | head %.0f%%\n",
         secs, 100.0*tA/1e9/secs, 100.0*tFetch/1e9/secs, 100.0*tDisk/1e9/secs, 100.0*st/secs, 100.0*tB/1e9/secs, 100.0*tE/1e9/secs, 100.0*tHead/1e9/secs);
+      // absolute per-token phase times (ms) -- resolves the spill tax that integer percentages hide:
+      // graphB reads expert operands from VRAM slots; when slots spill to shared RAM (K past the 8 GB
+      // frontier), graphB ms/tok rises iff the spill costs PCIe bandwidth. Flat => spill is ~free.
+      printf("PHASE ms/tok: graphA=%.3f fetch=%.3f disk=%.3f H2D=%.3f graphB=%.3f embed=%.3f head=%.3f (ngen=%d)\n",
+        tA/1e6/ngen, tFetch/1e6/ngen, tDisk/1e6/ngen, st*1e3/ngen, tB/1e6/ngen, tE/1e6/ngen, tHead/1e6/ngen, ngen);
     }
     // ---- PREFETCH PREDICTOR CEILING: cross-token routing locality ----
     // predict token t+1's layer-L experts from token t's layer-L selection; ceiling = avg overlap/n_used.

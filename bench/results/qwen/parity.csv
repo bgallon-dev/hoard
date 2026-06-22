@@ -1,0 +1,4 @@
+test,matched,total,detail
+oracle_token_match_france,6,6,engine greedy GEN == llama.cpp oracle: 11751 13 198 760 6511 314
+lossless_naive_vs_cache,48,48,naive(recopy-every-token) == cache(LRU) bit-identical token-for-token
+olmoe_oracle_match,8,8,prior validation: OLMoE-1B-7B 8/8 token-for-token vs llama.cpp (fits-RAM full oracle)
