@@ -125,6 +125,17 @@ diffuse cold tail — which is why LRU works but prefetch is dead, and it correc
 | 35B (fit) | 0.999 | 0.778 | 0.391 |
 | 80B (measured) | 1.041 | 0.738 | 0.428 |
 
+> **No circularity in the prediction (read the code):** the 80B prediction
+> ([`close_loop.py:104`](../bench/close_loop.py)) uses the **35B's frozen `(s, α)`**; the 80B's measured
+> values in the table above are shown for **post-hoc stability check only — never inputs**, so the ~15 %
+> miss-curve error *includes* the cost of the α mismatch (0.391 vs 0.428). **One disclosed contamination
+> at a different level:** the *structure* of the sticky model (that skew+persistence suffices) was chosen
+> by fitting the 80B trace in `routing_model.py`. So the model *family* is informed by the 80B even though
+> its *parameters* are not. The structure is a 2-param, physically-motivated form validated in-sample on
+> both models *independently* (2.1 % / 4.4 %), not reverse-engineered from the 80B miss curve — but a
+> referee is right to note the family wasn't chosen blind, and the only clean cure is a third family
+> (untested; see boundaries).
+
 **The closed loop** (`bench/close_loop.py`): fit `(s, α-profile)` on the **35B** trace, generate
 synthetic routing for the 80B's *config* (E=512, u=10, L=48), run it through the validated LRU sim →
 predicted `m_nvme(K)`; combine with a-priori `b_e`=1.95, transferred `t_fixed/layer`=1.44, box BW:
@@ -237,14 +248,23 @@ also supplies the independent `B_vram` used in §4.
 which required adding an absolute graphB ms/tok timer to the engine). An aggregate-decode null is *not*
 "no tax": isolating `graphB` — the phase that reads expert operands out of the slots — shows it is **flat
 at 34.4 ms/tok for K=16…48** (peak 3.2–6.1 GB, no spill), then **jumps sharply at the ~7 GB effective
-VRAM limit** (the 8 GB card minus WDDM/driver reserve) to **64 ms at K=96** (2.3 GB spilled): a measured
-**+30 ms PCIe tax**, **`B_spill` ≈ 8 GB/s** (range 6–11), ~4× the 2.1 GB/s NVMe. It is invisible in
+VRAM limit** (the 8 GB card minus WDDM/driver reserve) to **64 ms at K=96** (2.3 GB spilled): a **measured +30 ms tax, paid at PCIe class**. It is invisible in
 aggregate `tok/s` only because the **same** extra slots cut NVMe-miss time by a near-equal **−30 ms**
 (disk 82→52 ms) — the two swings cancel, so `tok/s` stays flat (5.68→5.94). **Spill is graceful not
-because it is free, but because each spilled slot trades a 2 GB/s NVMe read for an ~8 GB/s PCIe read — a
-~4× win.** *(This corrects an earlier inference from the aggregate null that the tax was ≈0 and that WDDM
-preferentially keeps hot pages resident; the direct measurement shows a real, roughly geometric tax —
-the measurement the user insisted on, overturning the inferred null.)*
+because it is free, but because each spilled slot trades a slow NVMe read for a much faster PCIe read.**
+
+**What is measured vs estimated (don't over-read `B_spill`):** the **tax (+30 ms) and its direction
+(PCIe-class, beats NVMe)** are measured and clean. The *bandwidth number* `B_spill ≈ 8 GB/s` is **an
+estimate, not a pinned measurement**: it divides the tax by the bytes graphB reads from spilled slots,
+**assuming graphB touches spilled slots in proportion to their capacity share** — and the routing model
+(§3b) predicts the *opposite* (the hot, sticky head stays resident under WDDM-LRU, so spilled slots are
+disproportionately *cold-tail* and the access-weighted spill fraction is **below** capacity). It may also
+be part page-fault/paging overhead, not bandwidth-limited transfer. So treat `B_spill` as bounded, not
+pinned. Pinning it needs graphB latency **conditioned on how many of the token's selected slots fall past
+the spill frontier** (which the static plane locates exactly) — an instrument not yet built; it would
+*also* independently confirm the WDDM-LRU mechanism (cold slots over-represented in spill), which is
+currently inferred from the cancellation rather than observed. *(This already corrects an earlier, worse
+inference — that the tax was ≈0 — which the direct graphB measurement overturned.)*
 
 **Procurement reframe.** `B_vram_eff = dedicated VRAM + system-RAM overcommit`, overflow charged at
 ~PCIe (≈ free vs NVMe), hard ceiling = physical system RAM. So to push **K or context past 8 GB** you
@@ -272,12 +292,36 @@ GPU** — the opposite of the naive instinct. *(Windows-specific; see boundary 7
 5. **`B_nvme` is not globally constant** (§3c): the law is piecewise-constant-BW with the RAM-collapse as
    a labeled transition. `B_pcie`=16 GB/s is nominal; the H2D term is small (8–16 %) so the fit is
    insensitive to it.
-6. **The spill tier (§6) is now directly measured:** `B_spill` ≈ 8 GB/s (range 6–11) from the graphB
-   timer; the value's spread reflects the effective-VRAM-limit estimate (~7 GB) and the slot hit-fraction.
-   The static frontier is exact. Caveat: the byte-accounting that turns the graphB tax into `B_spill`
-   assumes graphB reads spilled slots roughly in proportion to their capacity share — plausible given the
-   measured tax tracks the spill fraction, but not independently verified.
+6. **The spill *tax* (§6) is measured; its *bandwidth* `B_spill` is bounded, not pinned.** +30 ms and
+   PCIe-class direction are solid; the 8 GB/s value assumes capacity-proportional access (the routing
+   model predicts sub-capacity) and bandwidth-limited (not fault-limited) transfer. See §6.
 7. **The spill *gracefulness* and its procurement conclusion are Windows/WDDM-specific.** On a Linux
    allocator that hard-fails instead of paging to host RAM, the overflow OOMs and "buy RAM not VRAM"
-   **reverses**. For a non-Windows deployment this must be re-tested or the conclusion scoped to
-   Windows-workstation targets.
+   **reverses**. For a non-Windows deployment this must be re-tested or scoped to Windows targets.
+
+---
+
+## 8. What this is — and the finite list to make it airtight
+
+**This document is complete and honest as a *deployment-sizing model* (the "can model X run on box Y at
+usable speed, and what hardware do I buy" artifact).** Every claim it makes for that purpose is measured
+or a-priori, with the over-reaches above marked. It is **not yet airtight as an academic result** — a
+referee has exactly **three** mandatory threads, and the point of listing them is that the open work is
+*finite*, not an endless adversarial surface:
+
+1. **Cross-family routing (kills the single-pair transfer, boundary 4).** Measure `(s, α, entropy)` on
+   OLMoE (MHA) and the 30B (`qwen3moe`) — two *engine runs* (the traces are **not** on disk), then
+   re-check transfer. Outcome decides between "α is architecturally predictable across families" (a
+   stronger result, maybe its own paper) and "α is family-specific → one routing-calibration run per
+   family" (weaker but clean). **Until run, the closed loop is a-priori *up to family membership*, n=1
+   family, 2 members.** This is the highest-leverage open item.
+2. **Pin `B_spill` (boundary 6).** Instrument graphB latency *conditioned on the count of the token's
+   selected slots past the spill frontier* (the plane locates it exactly). Converts B_spill from estimate
+   to measurement and independently confirms the WDDM-LRU mechanism.
+3. **Predict the RAM-collapse boundary, not just propagate it (boundary 5).** The law locates the VRAM
+   frontier exactly from a static plane but can only find the NVMe-collapse boundary by running into it.
+   The collapse is the *same kind of object* — allocation crossing physical RAM — so a static
+   **system-RAM** allocation plane (point `DRYRUN`/`MAXKV` at host RAM, find where it crosses 16 GB)
+   should predict the collapse onset a-priori, making the law predict its own failure mode. Either this
+   works (qualitatively stronger) or there's a reason it can't that should be stated. **Not yet
+   attempted** — flagged three times, named here as a discrete experiment rather than deferred again.

@@ -5,8 +5,15 @@ close_loop.py -- the end-to-end out-of-sample test the feasibility law actually 
 degrees of freedom. This closes the loop properly: predict the 80B's throughput from the 35B's
 routing parameters + the 80B's PUBLISHED CONFIG, with NOTHING measured on the 80B except for scoring.
 
+NO CIRCULARITY: the 80B prediction uses the 35B's FROZEN (s, alpha). The 80B's measured (s, alpha)
+are loaded only to print the stability table and the ground-truth miss curve for scoring -- they are
+NEVER fed into the synthetic generator (see synth_sticky_zipf call: s=src['s'], alpha=<35B profile>).
+The ~15% miss-curve error therefore INCLUDES the cost of the alpha mismatch (0.391 vs 0.428).
+(Disclosed caveat: the sticky model's STRUCTURE was chosen by fitting the 80B in routing_model.py, so
+the model family -- not its parameters -- is informed by the 80B. Cure = a third family; untested.)
+
 Pipeline (all inputs a-priori or transferred from the 35B):
-  routing model   : (Zipf skew s, per-layer reuse alpha) fit on the 35B trace
+  routing model   : (Zipf skew s, per-layer reuse alpha) fit on the 35B trace -- FROZEN, not re-fit to 80B
   80B config      : n_expert=512, n_used=10, n_layer=48          (published)
   -> synthesize 80B routing -> LRU sim -> predicted m_nvme(K), h_vram(K)
   b_e             : 1.95 MB  (a-priori from the 80B GGUF expert-tensor bytes)
