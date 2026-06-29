@@ -375,3 +375,123 @@ attn cosine 0.994 mag 0.844 -> the q/k repeat made it 1.000/1.001 exactly.
 VALIDATED: 80B teacher-forced 16/16 top-1 vs CPU oracle, |dL1| ~0.05-0.96 (FP-level, same as 35B). Chat works:
 "capital of France + landmark" -> "Paris ... Eiffel Tower" @ 4.29 tok/s, 80B on 8 GB. Launcher: chatnext.ps1.
 This is the most powerful model the engine runs at usable speed (A3B keeps it fast; bigger-active would crawl).
+
+## PREFILL FEASIBILITY (the coding-harness gate) — measured + adversarially audited (4/4 claims high-conf)
+Question: can the engine host an agentic coding harness? Decode (6.3-7.6 tok/s) was never the issue; PREFILL
+(time-to-first-token) is. Instrumented run_qwen35.cpp with two ENV-GATED hooks (normal runs byte-identical):
+`SYNTH_LEN=N` fills the prompt with N xorshift pseudo-random ids (diffuse routing); a `PREFILL:` line in the
+one-shot summary reports TTFT = clock from before pos 0 (tg0, after reset_state) to first emitted token (tfirst).
+MEASURED (Qwen3.5-35B qwen35moe, K=48, ram=2048/10240 experts):
+  256 tok -> 47.4 s (185 ms/tok) ; 2048 -> 279 s (136) ; 4096 -> 595 s (145, RISING).
+SUPER-LINEAR (not linear): secant ms/tok 129 (256->2048) -> 154 (2048->4096). Mechanism: the 10 FULL-attention
+layers concat K/V to pos p then matmul over p+1 keys = O(T^2) integrated over prefill; plus working set outgrows
+the fixed 2048-expert RAM tier -> rising cold-tail NVMe. Extrapolation is ORDER-OF-MAGNITUDE ONLY (3-pt quadratic
+has 0 dof, +-28% swing from +-5% single-point noise, curvature contaminated by ~18 s fixed startup in the 256-pt):
+qualitatively 8k ~tens of min, 16-24k ~hour+, and likely an UNDER-estimate (24k KV pressure + cold tail unmodeled).
+PER-TURN RE-PREFILL (confirmed, run_qwen35.cpp:445): chat re-prefills the ENTIRE conversation every turn
+(reset_state zeros GDN/conv state + loop from p=0 over full hist) -> cost O(N^2) over N turns, NOT pay-once.
+THE DECOMPOSITION (why this flips the strategy) — 595 s @ 4096 tok breaks down as:
+  per-position graph dispatch (40 layers x ~28 tiny matmuls x 4096 pos) = 237 s (40%)  [REMOVABLE by batching]
+  redundant expert re-streaming (evict from 48-slot pool + re-read later)  = 350 s (59%)  [REMOVABLE by batching]
+  irreducible NVMe floor (read each of 19 GB experts ONCE)                 =   8 s (1%)   [hardware floor]
+Read the WHOLE 19 GB expert set once = 9.1 s @ 2.08 GB/s (5.4 s @ device 3.5). So ~99% of the prefill wall is an
+ARTIFACT of reusing the single-token decode loop for prefill, NOT a hardware limit. b_e=1.90 MB/expert, t_fixed=57.8 ms/pos.
+BATCHED-PREFILL ESTIMATE: collapse 4096 per-position graphs into one graph/layer (GEMV->GEMM) + stream each touched
+expert once -> ~21 s @ 4096 (12 s compute @ ~2 TFLOP/s Q4/Vulkan + 8 s I/O floor) = 20-30x; helps ALL context sizes
+(small contexts are dispatch-bound, so batching the dispatch is the whole win; ~9-10x even at 256 tok). [ESTIMATE, not built.]
+VERDICT: a real file-reading/many-turn coding harness is GATED on the ENGINE, not the GPU. Two levers, both feasible
+without new hardware: (1) BATCHED PREFILL (20-30x on first-context ingestion — the big one); (2) INCREMENTAL RESUME
+across turns (skip reset_state, resume at a 'state-valid up to R' watermark; gdn_state/conv_state/kv.* already persist,
+allocated once) kills the O(N^2). Today's engine only supports a narrow short-context few-turn async helper. The Python
+agent loop on serve.py stays trivial; it's gated on these. AUDIT (4 parallel skeptics): measurement valid; per-turn
+re-prefill confirmed; synth-prompt proxy fair-to-conservative vs real diffuse code routing; batched-prefill floor confirmed.
+
+## BATCHED PREFILL BUILT (the lever) — token-exact, 7.7x measured (src/run_qwen35.cpp prefill_batched, ENV BATCH_PREFILL)
+Built the batched-prefill path: process the prompt in chunks of C tokens with per-BATCH graphs (not per-position),
+streaming each routed expert ONCE per (layer,chunk) instead of once per position. ENV: BATCH_PREFILL=1, PREFILL_CHUNK=C,
+PP_ORACLE=1 (compare final-pos argmax to the per-position path). Carries KV/GDN/conv state across chunks (persistent) -> token-exact.
+DE-RISK FIRST (src/batchgdn_test.cpp, no model): ggml_gated_delta_net AND ggml_ssm_conv with n_tokens=T are BIT-EXACT
+(max|d|=0.0) vs T sequential single-step calls on Vulkan, T up to 16. So batched GDN is a SINGLE gated_delta_net(...,K=1)
+call with the token dim lifted 1->C (the CPU ref runs the same per-token scan internally); Sv=128 is Vulkan-supported.
+This killed the top risk (the engine had only ever called these ops with n_tokens=1). mul_mat_id over a slot pool was
+already proven by run_specloop. Conv-state carry = last d_conv-1 cols of the [d_conv-1+C, cd] window (also bit-exact).
+IMPLEMENTATION: embed[n_embd,C] -> per layer { graph A batched (full-attn: q/k-norm + IMRoPE(qwen35,4*C section-major pos)
+/NEOX(qwen3next) + GQA + a HOST-BUILT CAUSAL MASK[nkv,C] in soft_max_ext (the one batched-only piece; per-pos passed nullptr) ;
+OR GDN: ssm_conv over [d_conv-1+C,cd] + single gated_delta_net(n_tokens=C) + arch-gated q/k repeat-interleave) -> router
+softmax[n_expert,C] -> host top-n_used + wnorm + expert UNION -> stream union ONCE into a GRAPH-LOCAL typed pool [n_embd,n_ff,U]
+(re-typed per layer, U=chunk union, backed by the existing RAM/NVMe tiers) -> graph B: mul_mat_id(GP/UP/DP, cx, idT) + gated
+shared expert + weighted sum + residual } -> head on last position. The per-position decode path is UNTOUCHED (stays the oracle).
+VALIDATED token-exact (final-pos argmax == per-position oracle): qwen35moe C=1/2/4/8/16/64/128, multi-chunk carry (T=64 C=16==C=64,
+T=256 C=128), and qwen3next-80B C=1/4. Both arches' GDN/conv/rope/ssm_ba/repeat batch correctly.
+MEASURED (Qwen3.5-35B, K=48, ram=2048; per-position baselines from the PREFILL FEASIBILITY section above):
+  T=2048: per-pos 278.9s ; batched C=256/512/1024/2048 = 125.2/75.7/51.0/36.7 s = 2.2/3.7/5.5/7.6x (single chunk best).
+  T=4096: per-pos 595s   ; batched C=2048/4096 = 84.9/77.3 s = 7.0/7.7x ; 18.9 ms/tok vs 145 (per-pos) = 7.7x per-token.
+  Qwen3-Next-80B: batched T=1024 C=1024 = 39.3 s (38.4 ms/tok) ~ 5-6x.
+Speedup grows with C (fewer chunks -> less cross-chunk re-stream, more GEMM amortization); single-chunk is best when it fits 8 GB.
+HONEST GAP: measured 7.7x < the 20-30x PROJECTION (~20s @4096) -- same projection-overshoots-measurement pattern as the I/O-fork
+ceiling. The residual ~57s is overhead the projection ignored: per-(layer,chunk) graph construction + gallocr, RAM->VRAM tensor_set
+re-streaming into a FRESH graph-local pool every chunk (NO cross-chunk/cross-layer VRAM residency reuse -- the deferred persistent-
+typed-pool optimization), the first-pass NVMe read of the ~19 GB working set, and the 10 full-attn layers' O(T^2) score matrices.
+Those are the next levers (persistent VRAM pool w/ LRU across chunks is the biggest).
+FULLY WIRED INTO generate() (decode-resume DONE): generate() takes a Cbatch arg; when >0 it calls prefill_batched to build KV/GDN/conv
+state for 0..T-1, samples the first token from the final-position logits, then runs the EXISTING per-position decode loop from p=T on that
+state (no reset). Used by BOTH one-shot and the chat REPL when BATCH_PREFILL=1. The per-position path (Cbatch=0) is untouched = the oracle.
+VALIDATED token-exact END-TO-END (not just first token): VALIDATE_PREFILL runs per-position vs batched+decode over N gen tokens and compares
+the full sequence -> MATCH (qwen35moe); real greedy chat output ("three prime numbers..." / "capital of Japan") is BYTE-IDENTICAL batched vs
+per-position on both 35B and 80B. Launchers chat35.ps1 / chatnext.ps1 now default to batched prefill (PREFILL_CHUNK=256; -Chunk 0 disables).
+Tooling: BATCH_PREFILL/PREFILL_CHUNK/VALIDATE_PREFILL/VNGEN env-gated; normal runs unaffected. New file src/batchgdn_test.cpp (primitive smoke test).
+REMAINING (optional polish, not blocking use): persistent VRAM pool to close toward ~20s; incremental resume ACROSS chat turns (only prefill new
+tokens -> kills the O(N^2) multi-turn re-prefill; today each turn batched-prefills the whole conversation, but fast).
+
+## BATCHED PREFILL OPTIMIZATION ROUND (measure-first; PTIME=1 phase timers)
+MEASURED the batched-prefill breakdown (T=4096 C=4096, PTIME) to optimize the REAL bottleneck, not the assumed one:
+  graphA 38s (compute 29s [full-attn 20s + GDN 10s] + construct 8s) | graphB 35s (compute 28s) | nvme 10s | poolstage 2.6s.
+=> COMPUTE-BOUND (~58s of GPU compute = the RX 6600 floor), NOT streaming-bound. This REJECTED the planned "persistent VRAM expert pool"
+  optimization: it targets poolstage (2.6s) + nvme re-stream, which are tiny -- not worth the mixed-quant-type complexity. Measure-first paid off again.
+OPTIMIZATIONS DONE (token-exact preserved; both numerically inert -> verified single-chunk still == per-position, coherent multi-chunk == per-position):
+  (1) ggml_init context 512MB->16MB for graphA/graphB: the per-(layer,chunk) 512MB metadata-arena malloc/free was churning OS page tables
+      (~80 graphs/chunk). Cut graphA construct 18s->8s. The metadata needs <1MB; 512MB was 500x oversized.
+  (2) Mask + position HOIST: the causal mask [nkv,m] and IMRoPE position buffer are identical for all 10 full-attn layers in a chunk -> build ONCE
+      per chunk instead of 10x (was rebuilding a 67MB mask + 16.7M-iteration fill per full-attn layer).
+  Net single-chunk T=4096: ~86s (compute floor ~58s + construct ~13s + nvme ~10s) = ~7x; the compute floor is the hard GPU limit (q4_K/Vulkan
+  on RX 6600 ~1 TFLOP/s effective). Further single-chunk gains need kernel work (flash-attn for the 20s full-attn O(T^2), faster mul_mat_id) -- out of scope.
+INCREMENTAL RESUME ACROSS TURNS (the big multi-turn win) -- DONE: prefill_batched takes resume_from; chat tracks g_state_pos = positions with
+  valid KV/GDN/conv state, carried across turns. Each turn prefills ONLY the new tokens (resume_from..Tp), not the whole conversation -> O(N) per turn
+  instead of O(N^2). Demonstrated: turns prefilled 23(cold)/20/19/19 new tokens over growing 23/44/64/85 ctx; answers Paris/Berlin/Rome/Madrid correct.
+  VALIDATED token-exact: incremental == full-re-prefill (NO_INCREMENTAL=1) byte-identical (Paris/Berlin/Rome). Watermark reset on <<<RESET>>>/LOAD.
+CORRECTNESS NOTE (multi-chunk): batched multi-chunk == per-position on COHERENT prompts (verified PREFILL_CHUNK=8 over a real prompt = byte-identical).
+  On DEGENERATE SYNTH random-token prompts the chunked-GDN-scan FP reassociation (4x64-with-carry vs one 256-scan) flips near-tied argmaxes into an
+  attractor -- the same benign greedy near-tie sensitivity already documented for CPU-vs-Vulkan. Default chat PREFILL_CHUNK=256: prompts <=256 are
+  single-chunk (bit-exact); larger use multi-chunk (FP-close, coherent-validated). New env PTIME=1 (phase timers), NO_INCREMENTAL=1 (force full re-prefill).
+
+## OPTIMIZATION-IDEAS TEST ROUND (after a web-research pass; measure-first, all 4 candidate angles tested -- 3 rejected/marginal)
+Refined PTIME breakdown @T=4096 C=4096: graphA 43s (compute 29s [full-attn 19s + GDN 10s] + H<->D-xfer 7.5s + build/alloc 6.8s) | graphB compute 31s
+  | nvme 13s | poolstage ~3s. => ENGINE IS COMPUTE-BOUND (~59s q4_K matmul on the RX 6600). Reducible overhead ~20s = H<->D residual round-trip + cold-tail nvme.
+(1) CHUNKWISE-PARALLEL GDN -- REJECTED by isolation benchmark (src/batchgdn_test.cpp time_gdn): the fused ggml_gated_delta_net op is ALREADY parallel
+   (0.0017 ms/token, plateaus; ~225 ms TOTAL for 30 GDN layers @4096). The "10s GDN" in PTIME is the surrounding DENSE MATMULS (attn_qkv/attn_gate/ssm_out
+   projections + conv + router), NOT the recurrence. A chunked-matmul delta rule (WY/UT transform) would optimize the wrong thing. Clean negative result.
+(2) SPECULATIVE PREFETCH to hide nvme -- nvme (13s) is the irreducible COLD TAIL: RAM tier is already 11.4 GB of 15.8 GB system RAM, so a bigger tier can't
+   reduce it. Hideable behind compute (we're compute-bound) but needs a speculative expert predictor (PreScope LLaPor / Mixtral-offload gating-similarity, ~90-99%
+   acc) + a THREAD-SAFE RAM tier -- a real sub-project, bounded ~13s. DEFERRED with the path documented.
+(3) PERSISTENT SCRATCH BUFFER (arena) -- IMPLEMENTED (token-exact): one 32 MB host metadata arena reused for every per-(layer) ggml_init instead of malloc/free.
+   But malloc was NOT the bottleneck (the earlier 512MB->16MB fix already killed the big-malloc churn): construct = H<->D-xfer 7.5s + build/alloc 6.8s. Marginal; kept as hygiene.
+(4) PINNED / page-locked host memory -- REJECTED for this setup: the 11.4 GB RAM tier exceeds VirtualLock working-set limits, AND ggml-Vulkan stages H<->D through
+   its OWN internal buffer (pinning the user pointer never reaches the DMA path). Not actionable without modifying ggml-vulkan.
+ON-GPU RESIDUAL -- DONE (the one clean lever): keep the residual stream in PERSISTENT VRAM across layers instead of round-tripping it through host.
+   3 persistent VRAM tensors per prefill_batched call (Xg=residual, fxg=router/expert input, fig=post-attn residual; [n_embd,Cm], ~96 MB @ Cm=4096, freed at end).
+   graphA reads Xg (ix, no H2D) + cpy's fx->fxg, ffn_inp->fig (no D2H); only the 4 MB router probs leaves the GPU. graphB reads fxg (ifx) + fig, does the residual
+   add moe+shared+ffn_inp ON-GPU and cpy's the new residual into Xg (no D2H). head reads Xg's last column. RESULT: H<->D-xfer 7.5s -> 0.4s (-7.1s), the host-orchestrated
+   round-trip is gone. VALIDATED token-exact: single-chunk batched==per-position; coherent multi-chunk (PREFILL_CHUNK=8) byte-identical; multi-turn incremental correct.
+   ADVERSARIAL REVIEW (3 lenses) = CORRECT: cpy-into-persistent-view is the canonical ggml pattern (== KV-cache writes); the shared gallocr provably never touches the
+   rbuf tensors (t->buffer!=NULL excludes them); residual add order == oracle; Cm=min(C,Tp-start) >= every chunk's m (no overrun); works for both archs (qwen3next also
+   has a shared expert + is_qwen35==true). Added an rbuf NULL-check (clean fail on VRAM-OOM vs segfault). Net single-chunk ~80s (compute floor ~58s + nvme ~10-14s noisy + build/alloc ~7s).
+   REMAINING overhead is the cold-tail nvme (10-14s, needs speculative prefetch + thread-safe tier) and ggml build/alloc (~7s); the 28s mul_mat_id + 19s full-attn are the
+   hard q4_K/Vulkan compute floor (only faster kernels / flash-attn move them -- out of scope for a hand-built ggml engine). New diagnostic: time_gdn in batchgdn_test.
+
+## POST-OPTIMIZATION PREFILL BENCHMARK (BENCH=K env: K in-process reps, rep0 cold / rest warm-RAM-tier; noise-averaged, supersedes noisy single runs)
+Qwen3.5-35B, K=48, RAM=2048, single-chunk (PREFILL_CHUNK=4096). WARM-mean TTFT (3 reps):
+  T=512 -> 17.8s (34.7 ms/tok, 28.8 tok/s) | T=1024 -> 24.1s (23.5, 42.5) | T=2048 -> 34.0s (16.6, 60.2) | T=4096 -> 71.7s (17.5, 57.1).
+HEADLINE: steady-state ~16-17 ms/tok (~58-60 tok/s prefill) at T>=2048; ~8.3x vs per-position (T=2048 279s->34s, T=4096 595s->71.7s), token-exact.
+Per-token cost falls then plateaus (fixed ~7s build/alloc amortizes); slight uptick @4096 = full-attn O(T^2). COLD ~= WARM at T>=1024 (cold 72.8 vs warm 71.7 @4096):
+once the model file is OS-cached + RAM tier holds the working set, repeated prefills don't degrade -- cold-tail nvme is small in practice. Small prompts pay the fixed
+graph-construction tax (34.7 ms/tok @512). The remaining floor is pure q4_K/Vulkan compute (mul_mat_id + full-attn). New env: BENCH=K (in-process prefill bench).

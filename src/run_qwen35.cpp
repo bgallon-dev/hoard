@@ -27,6 +27,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <deque>
+#include <algorithm>
 #include <random>
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -295,6 +296,11 @@ int main(int argc,char**argv){
         ngen=atoi(argv[3]); mode=argv[4]; Karg=(argc>5)?atoi(argv[5]):0;
         char* s=strdup(argv[2]); for(char* p=strtok(s,","); p; p=strtok(nullptr,",")) seq.push_back(atoi(p)); free(s);
     }
+    if(const char* sl=getenv("SYNTH_LEN")){   // prefill benchmark: synthetic diffuse-routing prompt of N tokens
+        int n=atoi(sl); seq.clear(); uint32_t r=2463534242u;
+        for(int i=0;i<n;++i){ r^=r<<13; r^=r>>17; r^=r<<5; seq.push_back((int32_t)(r%100000u)); }  // xorshift32 pseudo-random ids -> diffuse routing
+        fprintf(stderr,"[synth] %d-token synthetic prompt (xorshift, diffuse routing)\n",n);
+    }
     int T=(int)seq.size();
     // teacher-forcing validation: TFLEN=<prompt_len> -> treat first TFLEN ids as prompt,
     // follow the rest of seq verbatim (don't substitute argmax), dump top-5 logits per tip.
@@ -429,16 +435,256 @@ int main(int argc,char**argv){
 
     std::vector<float> x(n_embd);
     std::vector<int32_t> gen;
-    struct timespec t0{},t1{}; bool timing=false;
+    struct timespec t0{},t1{},tg0{},tfirst{}; bool timing=false;
     size_t peak_compute=0;
     auto NOW=[](){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (long long)t.tv_sec*1000000000LL+t.tv_nsec; };
     long long tE=0,tA=0,tFetch=0,tDisk=0,tB=0,tHead=0;   // decode-only phase timers (ns)
 
+    // ============================ BATCHED PREFILL (the 20-30x lever) ============================
+    // Process the prompt in chunks of C tokens with batched graphs (per-batch instead of per-position),
+    // streaming each routed expert ONCE per (layer,chunk) instead of once per position. Builds the SAME
+    // KV/GDN/conv state as the per-position path (carried across chunks; state tensors persist), so it is
+    // token-exact. Returns logits at the final prompt position into `out_logits`. ENV: BATCH_PREFILL=1, PREFILL_CHUNK=C.
+    // Validated primitives: ggml_gated_delta_net / ggml_ssm_conv batched == sequential (bit-exact, batchgdn_test);
+    // mul_mat_id over a slot pool (run_specloop). The only batched-only piece is the causal mask on full-attn.
+    // resume_from>0: INCREMENTAL prefill -- the KV/GDN/conv state for [0,resume_from) is already valid (prior turn);
+    // skip reset and prefill only [resume_from, Tp). Used for multi-turn chat to avoid re-prefilling the whole conversation.
+    auto prefill_batched=[&](std::vector<int32_t>& seq,int Tp,int C,std::vector<float>& out_logits,int resume_from){
+        if(resume_from<=0) reset_state();
+        int Hv=gdn_Hv,Hk=gdn_Hk,Sv=gdn_Sv,kd=gdn_key_dim,vd=gdn_val_dim,cd=gdn_conv_dim;
+        bool mrope=(is_qwen35 && !is_qwen3next);
+        long long pe=0,pa=0,pn=0,pv=0,pbt=0,ph=0; bool ptime=getenv("PTIME")!=nullptr;   // prefill phase timers (ns): embed/graphA/nvme/poolstage/graphB/head
+        std::vector<char> scratch((size_t)32*1024*1024);   // ONE persistent host metadata arena, reused for every per-layer ggml_init (no malloc/free churn)
+        // ON-GPU RESIDUAL: keep the residual stream (Xg), router input (fxg) and post-attn residual (fig) in PERSISTENT VRAM
+        // across the graphA->host-route->graphB boundary, so only the 4MB router probs leave the GPU per layer (vs ~230MB).
+        int Cm=std::min(C,Tp-(resume_from>0?resume_from:0)); if(Cm<1)Cm=1;
+        ggml_context* rctx=ggml_init({(size_t)4*ggml_tensor_overhead()+256,nullptr,true});
+        ggml_tensor* Xg =ggml_new_tensor_2d(rctx,GGML_TYPE_F32,n_embd,Cm);   // residual stream
+        ggml_tensor* fxg=ggml_new_tensor_2d(rctx,GGML_TYPE_F32,n_embd,Cm);   // post-attn-norm router/expert input
+        ggml_tensor* fig=ggml_new_tensor_2d(rctx,GGML_TYPE_F32,n_embd,Cm);   // post-attn residual (added back after MoE)
+        ggml_backend_buffer_t rbuf=ggml_backend_alloc_ctx_tensors(rctx,backend);
+        if(!rbuf){ fprintf(stderr,"prefill_batched: residual VRAM alloc failed (Cm=%d)\n",Cm); ggml_free(rctx); out_logits.assign(n_vocab,0.f); return; }
+        for(int base=(resume_from>0?resume_from:0); base<Tp; base+=C){
+            int m=std::min(C,Tp-base); int nkv=base+m;
+            // HOIST: causal mask [nkv,m] + positions are identical for every full-attn layer in this chunk -> build once
+            std::vector<int32_t> pp(mrope?4*m:m); for(int t=0;t<m;++t){ if(mrope){ for(int s=0;s<4;++s) pp[(size_t)s*m+t]=base+t; } else pp[t]=base+t; }
+            std::vector<float> mk((size_t)nkv*m); for(int t=0;t<m;++t)for(int j=0;j<nkv;++j) mk[(size_t)t*nkv+j]=(j<=base+t)?0.0f:-INFINITY;
+            // ---- graph E: embed m tokens -> Xg[:, 0:m] (stays on GPU) ----
+            { long long _te=NOW(); ggml_context* g=ggml_init({(size_t)32*1024*1024,scratch.data(),true}); ggml_cgraph* gf=ggml_new_graph(g);
+              ggml_tensor* it=ggml_new_tensor_1d(g,GGML_TYPE_I32,m); ggml_set_input(it);
+              ggml_tensor* e=ggml_get_rows(g,M.get("token_embd.weight"),it);
+              ggml_tensor* cpy=ggml_cpy(g,e,ggml_view_2d(g,Xg,n_embd,m,Xg->nb[1],0));
+              ggml_build_forward_expand(gf,cpy); ggml_gallocr_alloc_graph(galloc,gf);
+              ggml_backend_tensor_set(it,seq.data()+base,0,(size_t)m*4); ggml_backend_graph_compute(backend,gf);
+              ggml_free(g); pe+=NOW()-_te; }
+            for(int il=0; il<n_layer; ++il){
+                std::vector<float> probs((size_t)n_expert*m);   // only the router softmax comes to host (for expert selection)
+                // ---- graph A: attention (full OR GDN) + post-attn norm + router, batched over m ----
+                long long _ta=NOW();
+                { ggml_context* g=ggml_init({(size_t)16*1024*1024,scratch.data(),true});
+                  ggml_cgraph* gf=ggml_new_graph_custom(g,8192,false);
+                  ggml_tensor* ix=ggml_view_2d(g,Xg,n_embd,m,Xg->nb[1],0);   // residual already on GPU (no H2D)
+                  ggml_tensor* ip=ggml_new_tensor_1d(g,GGML_TYPE_I32,mrope?4*m:m); ggml_set_input(ip);
+                  ggml_tensor* mask=ggml_new_tensor_2d(g,GGML_TYPE_F32,nkv,m); ggml_set_input(mask);   // causal [nkv,m]
+                  ggml_tensor* xn=ggml_mul(g,ggml_rms_norm(g,ix,eps),M.blk(il,"attn_norm.weight"));
+                  ggml_tensor* att; ggml_tensor* extra1=nullptr; ggml_tensor* extra2=nullptr;
+                  if(!is_recr[il]){
+                      ggml_tensor* Qg=ggml_mul_mat(g,M.blk(il,"attn_q.weight"),xn);          // [head_dim*n_head*2, m]
+                      size_t es=ggml_element_size(Qg);
+                      ggml_tensor* Qc=ggml_view_3d(g,Qg,head_dim,n_head,m,es*head_dim*2,es*head_dim*2*n_head,0);
+                      Qc=ggml_mul(g,ggml_rms_norm(g,Qc,eps),M.blk(il,"attn_q_norm.weight"));
+                      ggml_tensor* gt=ggml_view_3d(g,Qg,head_dim,n_head,m,es*head_dim*2,es*head_dim*2*n_head,es*head_dim);
+                      gt=ggml_cont_2d(g,gt,n_embd_attn,m);
+                      ggml_tensor* Kc=ggml_reshape_3d(g,ggml_mul_mat(g,M.blk(il,"attn_k.weight"),xn),head_dim,n_head_kv,m);
+                      Kc=ggml_mul(g,ggml_rms_norm(g,Kc,eps),M.blk(il,"attn_k_norm.weight"));
+                      ggml_tensor* Vc=ggml_reshape_3d(g,ggml_mul_mat(g,M.blk(il,"attn_v.weight"),xn),head_dim,n_head_kv,m);
+                      if(is_qwen3next){ Qc=ggml_rope_ext(g,Qc,ip,nullptr,64,GGML_ROPE_TYPE_NEOX,n_ctx_orig,freq_base,1,0,1,32,1);
+                                        Kc=ggml_rope_ext(g,Kc,ip,nullptr,64,GGML_ROPE_TYPE_NEOX,n_ctx_orig,freq_base,1,0,1,32,1); }
+                      else { int sec[4]={rope_sections[0],rope_sections[1],rope_sections[2],rope_sections[3]};
+                             Qc=ggml_rope_multi(g,Qc,ip,nullptr,64,sec,GGML_ROPE_TYPE_IMROPE,n_ctx_orig,freq_base,1,0,1,32,1);
+                             Kc=ggml_rope_multi(g,Kc,ip,nullptr,64,sec,GGML_ROPE_TYPE_IMROPE,n_ctx_orig,freq_base,1,0,1,32,1); }
+                      ggml_tensor* kc=kv.k[il]; ggml_tensor* vc=kv.v[il];
+                      ggml_tensor* dk=ggml_view_3d(g,kc,head_dim,n_head_kv,m,kc->nb[1],kc->nb[2],(size_t)base*kc->nb[2]);
+                      ggml_tensor* dv=ggml_view_3d(g,vc,head_dim,n_head_kv,m,vc->nb[1],vc->nb[2],(size_t)base*vc->nb[2]);
+                      extra1=ggml_cpy(g,Kc,dk); extra2=ggml_cpy(g,Vc,dv);
+                      ggml_tensor *Kall,*Vall;
+                      if(base==0){Kall=Kc;Vall=Vc;} else {
+                          Kall=ggml_concat(g,ggml_view_3d(g,kc,head_dim,n_head_kv,base,kc->nb[1],kc->nb[2],0),Kc,2);
+                          Vall=ggml_concat(g,ggml_view_3d(g,vc,head_dim,n_head_kv,base,vc->nb[1],vc->nb[2],0),Vc,2); }
+                      ggml_tensor* q=ggml_permute(g,Qc,0,2,1,3);
+                      ggml_tensor* k=ggml_permute(g,Kall,0,2,1,3);
+                      ggml_tensor* kq=ggml_soft_max_ext(g,ggml_mul_mat(g,k,q),mask,1.0f/sqrtf((float)head_dim),0.0f);
+                      ggml_tensor* vv=ggml_cont(g,ggml_permute(g,Vall,1,2,0,3));
+                      ggml_tensor* kqv=ggml_permute(g,ggml_mul_mat(g,vv,kq),0,2,1,3);
+                      ggml_tensor* ao=ggml_cont_2d(g,kqv,n_embd_attn,m);
+                      ao=ggml_mul(g,ao,ggml_sigmoid(g,gt));
+                      att=ggml_mul_mat(g,M.blk(il,"attn_output.weight"),ao);
+                  } else {
+                      ggml_tensor* qkv=ggml_mul_mat(g,M.blk(il,"attn_qkv.weight"),xn);        // [cd, m]
+                      ggml_tensor* z=ggml_mul_mat(g,M.blk(il,"attn_gate.weight"),xn);         // [vd, m]
+                      ggml_tensor* beta; ggml_tensor* al;
+                      if(is_qwen3next){ int vpg=Hv/Hk;
+                          ggml_tensor* ba=ggml_reshape_3d(g,ggml_mul_mat(g,M.blk(il,"ssm_ba.weight"),xn),vpg*2,Hk,m); // [vpg*2,Hk,m]
+                          ggml_tensor* br=ggml_cont(g,ggml_view_3d(g,ba,vpg,Hk,m,ba->nb[1],ba->nb[2],0));
+                          ggml_tensor* ar=ggml_cont(g,ggml_view_3d(g,ba,vpg,Hk,m,ba->nb[1],ba->nb[2],(size_t)vpg*ggml_element_size(ba)));
+                          beta=ggml_sigmoid(g,ggml_reshape_2d(g,br,Hv,m));
+                          al  =ggml_reshape_2d(g,ar,Hv,m);
+                      } else { beta=ggml_sigmoid(g,ggml_mul_mat(g,M.blk(il,"ssm_beta.weight"),xn)); // [Hv,m]
+                               al  =ggml_mul_mat(g,M.blk(il,"ssm_alpha.weight"),xn); }                // [Hv,m]
+                      beta=ggml_reshape_4d(g,beta,1,Hv,m,1);
+                      al=ggml_softplus(g,ggml_add(g,al,M.blk(il,"ssm_dt.bias")));
+                      ggml_tensor* gg=ggml_reshape_4d(g,ggml_mul(g,al,M.blk(il,"ssm_a")),1,Hv,m,1);
+                      ggml_tensor* cs=conv_state[il];                                          // [d_conv-1, cd]
+                      ggml_tensor* qkvT=ggml_cont(g,ggml_transpose(g,qkv));                    // [m, cd]
+                      ggml_tensor* cin=ggml_concat(g,cs,qkvT,0);                               // [d_conv-1+m, cd]
+                      ggml_tensor* convo=ggml_silu(g,ggml_ssm_conv(g,cin,M.blk(il,"ssm_conv1d.weight"))); // [cd, m]
+                      extra2=ggml_cpy(g,ggml_view_2d(g,cin,ssm_d_conv-1,cd,cin->nb[1],(size_t)m*cin->nb[0]),cs); // roll conv state
+                      size_t cz=ggml_element_size(convo);
+                      ggml_tensor* qc=ggml_l2_norm(g,ggml_cont(g,ggml_view_3d(g,convo,Sv,Hk,m,cz*Sv,convo->nb[1],0)),eps);
+                      ggml_tensor* kc2=ggml_l2_norm(g,ggml_cont(g,ggml_view_3d(g,convo,Sv,Hk,m,cz*Sv,convo->nb[1],cz*kd)),eps);
+                      ggml_tensor* vc2=ggml_cont(g,ggml_view_3d(g,convo,Sv,Hv,m,cz*Sv,convo->nb[1],cz*kd*2));
+                      qc=ggml_reshape_4d(g,qc,Sv,Hk,m,1); kc2=ggml_reshape_4d(g,kc2,Sv,Hk,m,1); vc2=ggml_reshape_4d(g,vc2,Sv,Hv,m,1);
+                      if(is_qwen3next && Hv!=Hk){ int vpg=Hv/Hk;
+                          qc =ggml_reshape_4d(g,ggml_repeat_4d(g,ggml_reshape_4d(g,qc ,Sv,1,Hk,m),Sv,vpg,Hk,m),Sv,Hv,m,1);
+                          kc2=ggml_reshape_4d(g,ggml_repeat_4d(g,ggml_reshape_4d(g,kc2,Sv,1,Hk,m),Sv,vpg,Hk,m),Sv,Hv,m,1); }
+                      ggml_tensor* s0=ggml_reshape_4d(g,gdn_state[il],Sv,Sv,Hv,1);
+                      ggml_tensor* gdn=ggml_gated_delta_net(g,qc,kc2,vc2,gg,beta,s0,1);        // n_tokens=m, K=1
+                      size_t rs1=ggml_row_size(gdn->type,Sv);
+                      ggml_tensor* out=ggml_view_4d(g,gdn,Sv,Hv,m,1,rs1,ggml_row_size(gdn->type,Sv*Hv),ggml_row_size(gdn->type,Sv*Hv*m),0);
+                      ggml_tensor* ns=ggml_view_4d(g,gdn,Sv,Sv,Hv,1,rs1,ggml_row_size(gdn->type,Sv*Sv),ggml_row_size(gdn->type,Sv*Sv*Hv),ggml_row_size(gdn->type,Sv*Hv*m));
+                      extra1=ggml_cpy(g,ns,gdn_state[il]);
+                      ggml_tensor* zr=ggml_reshape_4d(g,z,Sv,Hv,m,1);
+                      ggml_tensor* on=ggml_mul(g,ggml_mul(g,ggml_rms_norm(g,out,eps),M.blk(il,"ssm_norm.weight")),ggml_silu(g,zr));
+                      att=ggml_mul_mat(g,M.blk(il,"ssm_out.weight"),ggml_reshape_2d(g,on,vd,m));
+                  }
+                  ggml_tensor* ffn_inp=ggml_add(g,att,ix);
+                  ggml_tensor* fx=ggml_mul(g,ggml_rms_norm(g,ffn_inp,eps),M.blk(il,"post_attention_norm.weight"));
+                  ggml_tensor* probsT=ggml_soft_max(g,ggml_mul_mat(g,M.blk(il,"ffn_gate_inp.weight"),fx)); // [n_expert,m]
+                  ggml_tensor* cfx=ggml_cpy(g,fx,ggml_view_2d(g,fxg,n_embd,m,fxg->nb[1],0));        // router/expert input -> persistent GPU
+                  ggml_tensor* cfi=ggml_cpy(g,ffn_inp,ggml_view_2d(g,fig,n_embd,m,fig->nb[1],0));   // post-attn residual -> persistent GPU
+                  ggml_set_output(probsT);
+                  ggml_build_forward_expand(gf,cfx); ggml_build_forward_expand(gf,cfi); ggml_build_forward_expand(gf,probsT);
+                  if(extra1) ggml_build_forward_expand(gf,extra1);
+                  if(extra2) ggml_build_forward_expand(gf,extra2);
+                  ggml_gallocr_alloc_graph(galloc,gf);
+                  if(!is_recr[il]){ ggml_backend_tensor_set(ip,pp.data(),0,pp.size()*4);   // only positions + causal mask H2D (ix is Xg, already on GPU)
+                      ggml_backend_tensor_set(mask,mk.data(),0,(size_t)nkv*m*4); }
+                  ggml_backend_graph_compute(backend,gf);
+                  ggml_backend_tensor_get(probsT,probs.data(),0,(size_t)n_expert*m*4);   // ONLY 4MB router probs leaves the GPU
+                  ggml_free(g);
+                }
+                pa+=NOW()-_ta;
+                // ---- host: per-token top-n_used + wnorm; expert UNION across the chunk ----
+                std::vector<int32_t> sel((size_t)n_used*m); std::vector<float> wgt((size_t)n_used*m,0.f);
+                std::set<int> uni;
+                for(int t=0;t<m;++t){
+                    const float* pr=probs.data()+(size_t)t*n_expert;
+                    std::vector<std::pair<float,int>> cand(n_expert); for(int e=0;e<n_expert;++e)cand[e]={pr[e],e};
+                    std::partial_sort(cand.begin(),cand.begin()+n_used,cand.end(),[](auto&a,auto&b){return a.first>b.first;});
+                    float ws=0; for(int j=0;j<n_used;++j) ws+=cand[j].first;
+                    if(wnorm){ if(ws<6.103515625e-5f) ws=6.103515625e-5f; } else ws=1.0f;
+                    for(int j=0;j<n_used;++j){ int e=cand[j].second; sel[(size_t)t*n_used+j]=e; wgt[(size_t)t*n_used+j]=cand[j].first/ws; uni.insert(e); touched.insert(il*n_expert+e); }
+                }
+                // ---- stream the union ONCE into RAM tier (NVMe on miss), assign pool slots 0..U-1 ----
+                std::vector<int> ulist(uni.begin(),uni.end()); int U=(int)ulist.size();
+                std::map<int,int> e2slot; for(int u=0;u<U;++u) e2slot[ulist[u]]=u;
+                std::vector<int> ramslot(U,-1); std::vector<IOJob> jobs; jobs.reserve(U*3);
+                for(int u=0;u<U;++u){ int e=ulist[u]; reqs++; int key=il*n_expert+e; auto rit=RT.key2slot.find(key);
+                    if(rit!=RT.key2slot.end()){ ram_hit++; RT.lru.remove(rit->second); RT.lru.push_front(rit->second); ramslot[u]=rit->second; }
+                    else { int rs=RT.lru.back(); RT.lru.pop_back(); int old=RT.slot2key[rs]; if(old>=0) RT.key2slot.erase(old);
+                        if(!RT.gbuf[rs]){ RT.gbuf[rs]=(uint8_t*)VirtualAlloc(NULL,gbsz,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
+                            RT.ubuf[rs]=(uint8_t*)VirtualAlloc(NULL,ubsz,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
+                            RT.dbuf[rs]=(uint8_t*)VirtualAlloc(NULL,dbsz,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE); }
+                        RT.slot2key[rs]=key; RT.key2slot[key]=rs; RT.lru.push_front(rs); ramslot[u]=rs; nvme_fall++;
+                        uint64_t go=H.goff[il]+(size_t)e*H.gstride[il], uo=H.uoff[il]+(size_t)e*H.ustride[il], od=H.doff[il]+(size_t)e*H.dstride[il];
+                        uint32_t gs=(uint32_t)H.gstride[il], us=(uint32_t)H.ustride[il], ds=(uint32_t)H.dstride[il];
+                        RT.ghead[rs]=(uint32_t)(go&4095); RT.uhead[rs]=(uint32_t)(uo&4095); RT.dhead[rs]=(uint32_t)(od&4095);
+                        jobs.push_back(IOJob{RT.gbuf[rs], go&~(uint64_t)4095, (RT.ghead[rs]+gs+4095u)&~4095u, RT.ghead[rs], gs});
+                        jobs.push_back(IOJob{RT.ubuf[rs], uo&~(uint64_t)4095, (RT.uhead[rs]+us+4095u)&~4095u, RT.uhead[rs], us});
+                        jobs.push_back(IOJob{RT.dbuf[rs], od&~(uint64_t)4095, (RT.dhead[rs]+ds+4095u)&~4095u, RT.dhead[rs], ds}); }
+                }
+                { struct timespec d0,d1; clock_gettime(CLOCK_MONOTONIC,&d0); run_jobs(io,jobs); clock_gettime(CLOCK_MONOTONIC,&d1);
+                  long long _dn=(d1.tv_sec-d0.tv_sec)*1000000000LL+(d1.tv_nsec-d0.tv_nsec); disk_ns+=_dn; pn+=_dn; for(auto&jb:jobs) disk_bytes+=jb.rsize; }
+                // ---- graph B: expert FFN via mul_mat_id over a graph-local typed pool [.,.,U] + shared expert ----
+                long long _tbt=NOW();
+                { ggml_context* g=ggml_init({(size_t)16*1024*1024,scratch.data(),true});
+                  ggml_cgraph* gf=ggml_new_graph_custom(g,4096,false);
+                  ggml_tensor* GP=ggml_new_tensor_3d(g,H.gtype[il],n_embd,n_ff,U); ggml_set_input(GP);
+                  ggml_tensor* UP=ggml_new_tensor_3d(g,H.utype[il],n_embd,n_ff,U); ggml_set_input(UP);
+                  ggml_tensor* DP=ggml_new_tensor_3d(g,H.dtype[il],n_ff,n_embd,U); ggml_set_input(DP);
+                  ggml_tensor* ifx=ggml_view_2d(g,fxg,n_embd,m,fxg->nb[1],0);   // expert input already on GPU (no H2D)
+                  ggml_tensor* idT=ggml_new_tensor_2d(g,GGML_TYPE_I32,n_used,m); ggml_set_input(idT);
+                  ggml_tensor* wT=ggml_new_tensor_3d(g,GGML_TYPE_F32,1,n_used,m); ggml_set_input(wT);
+                  ggml_tensor* cx=ggml_reshape_3d(g,ifx,n_embd,1,m);
+                  ggml_tensor* up=ggml_mul_mat_id(g,UP,cx,idT);
+                  ggml_tensor* ga=ggml_silu(g,ggml_mul_mat_id(g,GP,cx,idT));
+                  ggml_tensor* ex=ggml_mul_mat_id(g,DP,ggml_mul(g,up,ga),idT);          // [n_embd, n_used, m]
+                  ex=ggml_mul(g,ex,wT);
+                  ggml_tensor* mo=nullptr; for(int j=0;j<n_used;++j){ ggml_tensor* s=ggml_view_2d(g,ex,n_embd,m,ex->nb[2],(size_t)j*ex->nb[1]); mo=j==0?s:ggml_add(g,mo,s); }
+                  ggml_tensor* she=nullptr;
+                  if(is_qwen35){ ggml_tensor* sg=ggml_mul_mat(g,M.blk(il,"ffn_gate_shexp.weight"),ifx);
+                      ggml_tensor* su=ggml_mul_mat(g,M.blk(il,"ffn_up_shexp.weight"),ifx);
+                      ggml_tensor* sh=ggml_mul_mat(g,M.blk(il,"ffn_down_shexp.weight"),ggml_mul(g,ggml_silu(g,sg),su));
+                      ggml_tensor* sgate=ggml_sigmoid(g,ggml_mul_mat(g,M.blk(il,"ffn_gate_inp_shexp.weight"),ifx));
+                      she=ggml_mul(g,sh,sgate); }
+                  ggml_tensor* fin=ggml_view_2d(g,fig,n_embd,m,fig->nb[1],0);                               // post-attn residual (on GPU)
+                  ggml_tensor* xnew=is_qwen35? ggml_add(g,ggml_add(g,mo,she),fin) : ggml_add(g,mo,fin);     // moe + shared expert + residual
+                  ggml_tensor* cx2=ggml_cpy(g,xnew,ggml_view_2d(g,Xg,n_embd,m,Xg->nb[1],0));                // new residual -> Xg (stays on GPU)
+                  ggml_set_output(cx2); ggml_build_forward_expand(gf,cx2);
+                  ggml_gallocr_alloc_graph(galloc,gf);
+                  long long _tv=NOW();
+                  for(int u=0;u<U;++u){ int rs=ramslot[u];
+                      ggml_backend_tensor_set(GP,RT.gbuf[rs]+RT.ghead[rs],(size_t)u*H.gstride[il],H.gstride[il]);
+                      ggml_backend_tensor_set(UP,RT.ubuf[rs]+RT.uhead[rs],(size_t)u*H.ustride[il],H.ustride[il]);
+                      ggml_backend_tensor_set(DP,RT.dbuf[rs]+RT.dhead[rs],(size_t)u*H.dstride[il],H.dstride[il]); copies++; }
+                  pv+=NOW()-_tv;
+                  std::vector<int32_t> ids((size_t)n_used*m); for(size_t i=0;i<(size_t)n_used*m;++i) ids[i]=e2slot[sel[i]];
+                  ggml_backend_tensor_set(idT,ids.data(),0,(size_t)n_used*m*4);   // ifx is fxg (on GPU) -> no expert-input H2D
+                  ggml_backend_tensor_set(wT,wgt.data(),0,(size_t)n_used*m*4);
+                  ggml_backend_graph_compute(backend,gf);
+                  ggml_free(g); }                                                  // residual add (moe+shared+ffn_inp) done on GPU into Xg -- no D2H
+                pbt+=NOW()-_tbt;
+            }
+            if(base+m>=Tp){   // final chunk: head on the LAST position
+                long long _th=NOW(); out_logits.assign(n_vocab,0.f);
+                ggml_context* g=ggml_init({(size_t)16*1024*1024,scratch.data(),true}); ggml_cgraph* gf=ggml_new_graph(g);
+                ggml_tensor* ix=ggml_view_2d(g,Xg,n_embd,1,Xg->nb[1],(size_t)(m-1)*Xg->nb[1]);   // last residual column (on GPU)
+                ggml_tensor* lg=ggml_mul_mat(g,M.get("output.weight"),ggml_mul(g,ggml_rms_norm(g,ix,eps),M.get("output_norm.weight"))); ggml_set_output(lg);
+                ggml_build_forward_expand(gf,lg); ggml_gallocr_alloc_graph(galloc,gf);
+                ggml_backend_graph_compute(backend,gf); ggml_backend_tensor_get(lg,out_logits.data(),0,(size_t)n_vocab*4); ggml_free(g); ph+=NOW()-_th;
+            }
+            if(ptime) fprintf(stderr,"[prefill] chunk %d..%d/%d done\n",base,base+m,Tp);
+        }
+        if(ptime) fprintf(stderr,"[PTIME] embed=%.1fs graphA=%.1fs nvme=%.1fs poolstage=%.1fs graphB=%.1fs head=%.1fs\n",
+            pe/1e9,pa/1e9,pn/1e9,pv/1e9,pbt/1e9,ph/1e9);
+        ggml_backend_buffer_free(rbuf); ggml_free(rctx);   // free the persistent residual tensors
+    };
+
     // core streaming forward over `seq`, emitting each new token id to on_token.
     // params deliberately shadow seq/T/ngen so the loop body is unchanged; one-shot AND chat both call this.
-    auto generate=[&](std::vector<int32_t>& seq,int T,int ngen,const std::function<void(int)>& on_token){
-    reset_state();   // zero GDN recurrent + conv state at the start of each generation
-    for(int p=0;;++p){
+    auto generate=[&](std::vector<int32_t>& seq,int T,int ngen,const std::function<void(int)>& on_token,int Cbatch,int resumeFrom){
+    int p0=0;
+    if(Cbatch>0 && !tf && T>0){
+        // BATCHED PREFILL path: build KV/GDN/conv state for positions resumeFrom..T-1 (prefill_batched resets state
+        // only when resumeFrom<=0), sample the first token from the final-position logits, then DECODE per-position
+        // from p=T on the batched-built state (no reset). Output is identical to the per-position path (validated).
+        clock_gettime(CLOCK_MONOTONIC,&tg0);
+        std::vector<float> lg; prefill_batched(seq,T,Cbatch,lg,resumeFrom);
+        int bi=0; { float bv=lg[0]; for(int v=1;v<n_vocab;++v) if(lg[v]>bv){bv=lg[v];bi=v;} }   // argmax
+        if(g_temp>0.0f){ double mx=(double)lg[bi],cut=mx-12.0,sum=0;
+            for(int v=0;v<n_vocab;++v) if((double)lg[v]>=cut) sum+=exp(((double)lg[v]-mx)/g_temp);
+            double r=std::uniform_real_distribution<double>(0.0,sum)(g_rng),acc=0;
+            for(int v=0;v<n_vocab;++v) if((double)lg[v]>=cut){ acc+=exp(((double)lg[v]-mx)/g_temp); if(acc>=r){bi=v;break;} } }
+        clock_gettime(CLOCK_MONOTONIC,&tfirst);   // first token emitted => prefill (TTFT) done
+        gen.push_back(bi); on_token(bi);
+        static const bool noeos0=getenv("NOEOS")!=nullptr;
+        if(g_stop||(int)gen.size()>=ngen||(bi==eos_id&&!noeos0)){ clock_gettime(CLOCK_MONOTONIC,&t1); return; }
+        seq.push_back(bi); p0=T;                   // decode continues from position T (state already built)
+    } else {
+        reset_state();   // zero GDN recurrent + conv state at the start of each generation
+        clock_gettime(CLOCK_MONOTONIC,&tg0);   // prefill TTFT clock: start before position 0
+    }
+    for(int p=p0;;++p){
         if(p>=(int)seq.size()) break;
         if(p>=max_kv-1){ on_token(eos_id); break; }   // KV cache full: stop cleanly
         int32_t tok=seq[p];
@@ -706,6 +952,7 @@ int main(int argc,char**argv){
                 for(int v=0;v<n_vocab;++v) if((double)logits[v]>=cut){ acc+=exp(((double)logits[v]-mx)/g_temp); if(acc>=r){ bi=v; break; } }
             }
             gen.push_back(bi); on_token(bi);
+            if(gen.size()==1) clock_gettime(CLOCK_MONOTONIC,&tfirst);   // first token out => prefill (TTFT) done
             if(tf && p+1<(int)seq.size()){ int nt=seq[p+1];   // teacher-forced NLL of the true next token -> perplexity (quality probe)
                 double mx=logits[0]; for(int v=1;v<n_vocab;++v) if((double)logits[v]>mx) mx=logits[v];
                 double se=0; for(int v=0;v<n_vocab;++v) se+=exp((double)logits[v]-mx);
@@ -732,6 +979,7 @@ int main(int argc,char**argv){
         if(!lm){ fprintf(stderr,"vocab load failed\n"); return 1; }
         const llama_vocab* vocab=llama_model_get_vocab(lm);
         std::vector<int32_t> hist;                              // running conversation tokens (multi-turn)
+        int g_state_pos=0;   // INCREMENTAL: positions [0,g_state_pos) already have valid KV/GDN/conv state (carried across turns)
         auto respond=[&](const std::string& msg){
             // qwen3.5: disable thinking by pre-filling an empty <think></think> block (enable_thinking=false).
             // qwen3: the /no_think soft switch works. Either way -> concise answers, not 1k tokens of hidden reasoning.
@@ -748,11 +996,16 @@ int main(int argc,char**argv){
             int think_open=(is_qwen35&&!is_qwen3next)?248068:151667, think_close=(is_qwen35&&!is_qwen3next)?248069:151668; // <think>/</think> ids (qwen35moe vocab vs standard Qwen)
             gen.clear(); bool inthink=false; printf("\n");
             int maxgen=getenv("MAXGEN")?atoi(getenv("MAXGEN")):1024;   // cap chat generation (corpus collection wants bounded traces)
+            int batched=getenv("BATCH_PREFILL")?(getenv("PREFILL_CHUNK")?atoi(getenv("PREFILL_CHUNK")):256):0;
+            int resume=(batched && g_state_pos>0 && g_state_pos<Tp && getenv("NO_INCREMENTAL")==nullptr)?g_state_pos:0; // incremental: only prefill new tokens
+            if(batched) fprintf(stderr,"[turn] prefill %d new tokens of %d ctx%s\n",Tp-resume,Tp,resume?" [incremental resume]":" [cold]");
             generate(sq,Tp,maxgen,[&](int id){
                 if(id==think_open){inthink=true;return;} if(id==think_close){inthink=false;return;}  // hide <think>...</think>
                 if(inthink||id==eos_id) return;
-                char b[256]; int k=llama_token_to_piece(vocab,id,b,256,0,false); if(k>0){ fwrite(b,1,k,stdout); fflush(stdout); } });
+                char b[256]; int k=llama_token_to_piece(vocab,id,b,256,0,false); if(k>0){ fwrite(b,1,k,stdout); fflush(stdout); } },
+                batched,resume);
             printf("\n");
+            g_state_pos=(int)sq.size();   // decode left valid KV/GDN/conv state for all of sq (the eos appended below is processed next turn)
             if(sq.empty()||sq.back()!=eos_id) sq.push_back(eos_id);
             hist=sq;
             double s=(t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)/1e9;
@@ -769,7 +1022,7 @@ int main(int argc,char**argv){
             int32_t need=llama_tokenize(vocab,s.c_str(),(int)s.size(),nullptr,0,false,true);
             std::vector<llama_token> tt(need<0?-need:need);
             if(!tt.empty()) llama_tokenize(vocab,s.c_str(),(int)s.size(),tt.data(),(int)tt.size(),false,true);
-            hist.assign(tt.begin(),tt.end());
+            hist.assign(tt.begin(),tt.end()); g_state_pos=0;   // restored tokens have NO built state -> next respond() cold-prefills them
             fprintf(stderr,"[load] %zu turns -> %zu ctx tokens\n",msgs.size(),hist.size());
         };
         if(getenv("SERVE")){
@@ -794,7 +1047,7 @@ int main(int argc,char**argv){
                 if(line=="<<<LOAD>>>"){ loadmsgs.clear(); loading=true; continue; }                        // begin context restore
                 if(line=="<<<ENDLOAD>>>"){ loading=false; load_history(loadmsgs); putchar(4); fflush(stdout); continue; }
                 if(loading){ if(line.size()>=2 && (line[0]=='U'||line[0]=='A') && line[1]==' ') loadmsgs.push_back({line[0],b64dec(line.substr(2))}); continue; } // "U <b64>" / "A <b64>"
-                if(line=="<<<RESET>>>"){ hist.clear(); msg.clear(); putchar(4); fflush(stdout); continue; }
+                if(line=="<<<RESET>>>"){ hist.clear(); g_state_pos=0; msg.clear(); putchar(4); fflush(stdout); continue; }
                 if(line.rfind("<<<TEMP ",0)==0){ g_temp=(float)atof(line.c_str()+8); fprintf(stderr,"[temp] %.2f\n",g_temp); continue; } // "<<<TEMP 0.7>>>"
                 if(line=="<<<SEND>>>"){ if(!msg.empty()){ if(pf){ fprintf(pf,"# turn\n"); fflush(pf);} g_stop=false; respond(msg); msg.clear(); } putchar(4); fflush(stdout); continue; }
                 if(line=="/quit") break;
@@ -816,13 +1069,42 @@ int main(int argc,char**argv){
         llama_model_free(lm); fprintf(stderr,"\nbye.\n"); return 0;
     }
 
+    // batched prefill is enabled by BATCH_PREFILL=1 (chunk PREFILL_CHUNK, default 256); it builds the prompt
+    // state in batched graphs then decodes per-position from p=T. Output is token-identical to per-position.
+    int batchC = getenv("BATCH_PREFILL")?(getenv("PREFILL_CHUNK")?atoi(getenv("PREFILL_CHUNK")):256):0;
+    if(getenv("BENCH")){   // prefill benchmark: run prefill_batched K times in-process (rep0 cold, rest warm RAM tier) -> noise-averaged TTFT
+        int K=atoi(getenv("BENCH")); if(K<1)K=1; int C=batchC>0?batchC:T;
+        fprintf(stderr,"\nBENCH prefill: T=%d  C=%d  %d reps\n",T,C,K);
+        double warm=0,coldttft=0;
+        for(int r=0;r<K;++r){ std::vector<float> lg; struct timespec a,b; clock_gettime(CLOCK_MONOTONIC,&a);
+            prefill_batched(seq,T,C,lg,0); clock_gettime(CLOCK_MONOTONIC,&b);
+            double s=(b.tv_sec-a.tv_sec)+(b.tv_nsec-a.tv_nsec)/1e9;
+            fprintf(stderr,"  rep%d  TTFT=%7.2fs  %6.1f ms/tok  %.1f tok/s%s\n",r,s,T>0?s*1000.0/T:0,s>0?T/s:0,r==0?"  [cold]":"  [warm]");
+            if(r==0)coldttft=s; else warm+=s; }
+        if(K>1) fprintf(stderr,"BENCH T=%d: cold=%.2fs  warm-mean=%.2fs (%.1f ms/tok, %.1f tok/s)\n",T,coldttft,warm/(K-1),T>0?warm/(K-1)*1000.0/T:0,warm>0?(K-1)*T/warm:0);
+        return 0;
+    }
+    if(getenv("VALIDATE_PREFILL")){   // full-sequence token-exact check: per-position decode vs batched-prefill+decode
+        int nv=getenv("VNGEN")?atoi(getenv("VNGEN")):16;
+        std::vector<int> gp,gb;
+        { std::vector<int32_t> s1(seq.begin(),seq.begin()+T); gen.clear(); generate(s1,T,nv,[&](int id){gp.push_back(id);},0,0); }
+        { std::vector<int32_t> s2(seq.begin(),seq.begin()+T); gen.clear(); generate(s2,T,nv,[&](int id){gb.push_back(id);},batchC>0?batchC:256,0); }
+        bool match=(gp==gb);
+        printf("VALIDATE_PREFILL: per-pos vs batched(C=%d) over %d gen tokens => %s\n",batchC>0?batchC:256,(int)gp.size(),match?"MATCH":"*** MISMATCH ***");
+        printf("  per-pos:"); for(int id:gp)printf(" %d",id); printf("\n  batched:"); for(int id:gb)printf(" %d",id); printf("\n");
+        return match?0:1;
+    }
     // ---- one-shot generation (benchmark / validation) ----
-    generate(seq,T,ngen,[](int){});
+    gen.clear();
+    generate(seq,T,ngen,[](int){},batchC,0);
     if(csvf) fclose(csvf);
     if(gdf) fclose(gdf);
     if(pf) fclose(pf);
     if(nll_n>0) printf("QUALITY: teacher-forced over %ld positions: mean NLL=%.5f  perplexity=%.4f\n", nll_n, nll_sum/nll_n, exp(nll_sum/nll_n));
     double secs=(t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)/1e9;
+    double prefill_s=(tfirst.tv_sec-tg0.tv_sec)+(tfirst.tv_nsec-tg0.tv_nsec)/1e9;
+    printf("PREFILL: %d prompt tokens, TTFT=%.2f s = %.1f tok/s prefill = %.1f ms/token\n",
+        T, prefill_s, prefill_s>0?T/prefill_s:0, T>0?prefill_s*1000.0/T:0);
     vram += peak_compute;
 
     double per_exp=(H.gstride[0]+H.ustride[0]+H.dstride[0]);
